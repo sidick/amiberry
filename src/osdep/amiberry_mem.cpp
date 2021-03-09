@@ -9,7 +9,11 @@
 #include "uae/mman.h"
 #include <sys/mman.h>
 #include "sys/types.h"
+#ifndef __APPLE__
 #include "sys/sysinfo.h"
+#else
+#include <sys/sysctl.h>
+#endif
 
 #ifdef ANDROID
 #define valloc(x) memalign(getpagesize(), x)
@@ -59,10 +63,16 @@ void free_AmigaMem(void)
 
 bool can_have_1gb()
 {
+#if defined(__APPLE__)
+	long long total_phys_mem = 0;
+	size_t total_phys_mem_len = sizeof(total_phys_mem);
+	sysctlbyname("hw.memsize", &total_phys_mem, &total_phys_mem_len, NULL, 0);
+#else
 	struct sysinfo mem_info{};
 	sysinfo(&mem_info);
 	long long total_phys_mem = mem_info.totalram;
 	total_phys_mem *= mem_info.mem_unit;
+#endif
 	// Do we have more than 2GB in the system?
 	if (total_phys_mem > 2147483648LL)
 		return true;

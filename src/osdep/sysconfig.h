@@ -18,9 +18,13 @@
 #define FILESYS /* filesys emulation */
 #define UAE_FILESYS_THREADS
 #define AUTOCONFIG /* autoconfig support, fast ram, harddrives etc.. */
+#ifndef __APPLE__
 #define JIT /* JIT compiler support */
+#endif
 #if defined(ARMV6T2) || defined(CPU_AARCH64)
+#ifdef JIT
 #define USE_JIT_FPU
+#endif
 #endif
 #define NATMEM_OFFSET regs.natmem_offset
 /* #define CATWEASEL */ /* Catweasel MK2/3 support */
@@ -480,7 +484,9 @@ typedef int32_t uae_atomic;
 #define HAVE_SYS_STAT_H 1
 
 /* Define if you have the <sys/statfs.h> header file.  */
+#ifndef __APPLE__
 #define HAVE_SYS_STATFS_H 1
+#endif
 
 /* Define if you have the <sys/statvfs.h> header file.  */
 /* #undef HAVE_SYS_STATVFS_H */
@@ -503,7 +509,9 @@ typedef int32_t uae_atomic;
 /* #undef HAVE_SYS_UTIME_H */
 
 /* Define if you have the <sys/vfs.h> header file.  */
+#ifndef __APPLE__
 #define HAVE_SYS_VFS_H 1
+#endif
 
 /* Define if you have the <unistd.h> header file.  */
 #define HAVE_UNISTD_H 1
@@ -516,6 +524,16 @@ typedef int32_t uae_atomic;
 
 /* Define if you have the <windows.h> header file.  */
 /* #undef HAVE_WINDOWS_H */
+
+/* Define if you have the <linux/kd.h> header file. */
+#ifndef __APPLE__
+#define HAVE_LINUX_KD_H 1
+#endif
+
+/* Define if you have the <asm/sigcontext.h> header file. */
+#ifndef __APPLE__
+#define HAVE_ASM_SIGCONTEXT_H 1
+#endif
 
 #define FSDB_DIR_SEPARATOR '/'
 #define FSDB_DIR_SEPARATOR_S "/"
@@ -569,7 +587,7 @@ typedef char TCHAR;
 #define _tzset()            tzset()
 #define _timezone           timezone
 #define _daylight           daylight
-#ifdef ANDROID
+#if defined(ANDROID) || defined(__APPLE__)
 #define _ftelli64(x)        ftello(x)
 #define _fseeki64(x,y,z)    fseeko(x,y,z)
 #else
@@ -579,3 +597,22 @@ typedef char TCHAR;
 #define _wunlink(x)         unlink(x)
 #define _istalnum(x)        isalnum(x)
 
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+
+#define htobe16(x) OSSwapHostToBigInt16(x)
+#define htole16(x) OSSwapHostToLittleInt16(x)
+#define be16toh(x) OSSwapBigToHostInt16(x)
+#define le16toh(x) OSSwapLittleToHostInt16(x)
+
+#define htobe32(x) OSSwapHostToBigInt32(x)
+#define htole32(x) OSSwapHostToLittleInt32(x)
+#define be32toh(x) OSSwapBigToHostInt32(x)
+#define le32toh(x) OSSwapLittleToHostInt32(x)
+
+#define htobe64(x) OSSwapHostToBigInt64(x)
+#define htole64(x) OSSwapHostToLittleInt64(x)
+#define be64toh(x) OSSwapBigToHostInt64(x)
+#define le64toh(x) OSSwapLittleToHostInt64(x)
+
+#endif

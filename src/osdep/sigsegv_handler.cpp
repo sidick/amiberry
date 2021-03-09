@@ -36,7 +36,11 @@
 #endif
 #include "uae.h"
 
+#ifdef HAVE_ASM_SIGCONTEXT_H
 #include <asm/sigcontext.h>
+#else
+#include <sys/ucontext.h>
+#endif
 #include <signal.h>
 #include <dlfcn.h>
 #ifndef ANDROID
@@ -298,6 +302,7 @@ void signal_segv(int signum, siginfo_t* info, void* ptr)
 	ucontext_t* ucontext = (ucontext_t*)ptr;
 	Dl_info dlinfo;
 
+#ifdef JIT
 	output_log(_T("--- New exception ---\n"));
 
 #ifdef TRACER
@@ -378,6 +383,7 @@ void signal_segv(int signum, siginfo_t* info, void* ptr)
 			return;
 		}
 	}
+#endif
 
 	if (handled != HANDLE_EXCEPTION_NONE)
 		return;
@@ -397,6 +403,7 @@ void signal_buserror(int signum, siginfo_t* info, void* ptr)
 	trace_end();
 #endif
 
+#ifdef JIT
 	mcontext_t* context = &(ucontext->uc_mcontext);
 
 	unsigned long long* regs = context->regs;
@@ -446,6 +453,7 @@ void signal_buserror(int signum, siginfo_t* info, void* ptr)
 		output_log(_T("%s\n"), strings[i]);
 	output_log(_T("End of stack trace.\n"));
 
+#endif
 	output_log(_T("--- end exception ---\n"));
 
 	SDL_Quit();

@@ -30,6 +30,10 @@ Or if you're using an Arch-based distro (e.g. Manjaro), you can use these instea
 
       sudo pacman -S base-devel sdl2 sdl2_ttf sdl2_image flac mpg123 libmpeg2
 
+Or if you're using an ARM based MacOS, you can use these instead:
+
+      brew install sdl2 sdl2_image sdl2_ttf libmpeg2 flac mpg123
+
 ## Getting Amiberry
 
 The latest stable releases come with binaries, that you can download from the [Releases](https://github.com/midwan/amiberry/releases) area.

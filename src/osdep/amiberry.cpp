@@ -183,16 +183,20 @@ void set_key_configs(struct uae_prefs* p)
 		minimize_key = get_hotkey_from_config(p->minimize);
 }
 
+#ifdef JIT
 extern void signal_segv(int signum, siginfo_t* info, void* ptr);
 extern void signal_buserror(int signum, siginfo_t* info, void* ptr);
 extern void signal_term(int signum, siginfo_t* info, void* ptr);
+#endif
 
 extern void SetLastActiveConfig(const char* filename);
 
 char start_path_data[MAX_DPATH];
 char current_dir[MAX_DPATH];
 
+#ifdef HAVE_LINUX_KD_H
 #include <linux/kd.h>
+#endif
 #include <sys/ioctl.h>
 unsigned char kbd_led_status;
 char kbd_flags;
@@ -2965,7 +2969,8 @@ int main(int argc, char* argv[])
 	
 	normalcursor = SDL_GetDefaultCursor();
 	clipboard_init();
-	
+
+#ifdef HAVE_LINUX_KD_H
 	// set capslock state based upon current "real" state
 	ioctl(0, KDGKBLED, &kbd_flags);
 	ioctl(0, KDGETLED, &kbd_led_status);
@@ -2982,11 +2987,14 @@ int main(int argc, char* argv[])
 		inputdevice_do_keyboard(AK_CAPSLOCK, 0);
 	}
 	ioctl(0, KDSETLED, kbd_led_status);
+#endif
 
 	real_main(argc, argv);
 
+#ifdef HAVE_LINUX_KD_H
 	// restore keyboard LEDs to normal state
 	ioctl(0, KDSETLED, 0xFF);
+#endif
 
 	ClearAvailableROMList();
 	romlist_clear();

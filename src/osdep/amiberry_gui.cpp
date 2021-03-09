@@ -29,7 +29,9 @@
 #include "drawing.h"
 
 #ifdef AMIBERRY
+#ifndef __APPLE__
 #include <linux/kd.h>
+#endif
 #include <sys/ioctl.h>
 #endif
 
@@ -652,6 +654,7 @@ void gui_led(int led, int on, int brightness)
 	if (currprefs.kbd_led_scr != changed_prefs.kbd_led_scr) currprefs.kbd_led_scr = changed_prefs.kbd_led_scr;
 	//if (currprefs.kbd_led_cap != changed_prefs.kbd_led_cap) currprefs.kbd_led_cap = changed_prefs.kbd_led_cap;
 
+#ifndef __APPLE__
 	ioctl(0, KDGETLED, &kbd_led_status);
 
 	// Handle floppy led status
@@ -685,6 +688,7 @@ void gui_led(int led, int on, int brightness)
 	}
 
 	ioctl(0, KDSETLED, kbd_led_status);
+#endif
 }
 
 void gui_filename(int num, const char* name)
