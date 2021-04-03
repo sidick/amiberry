@@ -1920,6 +1920,7 @@ void target_default_options(struct uae_prefs* p, int type)
 	_tcscpy(p->action_replay, amiberry_options.default_ar_key);
 	_tcscpy(p->fullscreen_toggle, amiberry_options.default_fullscreen_toggle_key);
 
+	p->alt_tab_release = false;
 	p->sound_pullmode = 0;
 	p->input_analog_remap = false;
 
@@ -1930,6 +1931,15 @@ void target_default_options(struct uae_prefs* p, int type)
 	p->whdbootprefs.buttonwait = amiberry_options.default_whd_buttonwait;
 	p->whdbootprefs.showsplash = amiberry_options.default_whd_showsplash;
 	p->whdbootprefs.configdelay = amiberry_options.default_whd_configdelay;
+
+	// Disable Cycle-Exact modes that are not yet implemented
+	if (changed_prefs.cpu_cycle_exact || changed_prefs.cpu_memory_cycle_exact)
+	{
+		if (changed_prefs.cpu_model > 68010)
+		{
+			changed_prefs.cpu_cycle_exact = changed_prefs.cpu_memory_cycle_exact = false;
+		}
+	}
 }
 
 static const TCHAR* scsimode[] = { _T("SCSIEMU"), _T("SPTI"), _T("SPTI+SCSISCAN"), NULL };
@@ -1988,7 +1998,8 @@ void target_save_options(struct zfile* f, struct uae_prefs* p)
 	cfgfile_target_dwrite_str(f, _T("action_replay"), p->action_replay);
 	cfgfile_target_dwrite_str(f, _T("fullscreen_toggle"), p->fullscreen_toggle);
 	cfgfile_target_dwrite_str(f, _T("minimize"), p->minimize);
-	
+
+	cfgfile_target_dwrite_bool(f, _T("alt_tab_release"), p->alt_tab_release);
 	cfgfile_target_dwrite(f, _T("sound_pullmode"), _T("%d"), p->sound_pullmode);
 	cfgfile_target_dwrite_bool(f, _T("use_analogue_remap"), p->input_analog_remap);
 
@@ -2027,6 +2038,8 @@ int target_parse_option(struct uae_prefs* p, const char* option, const char* val
 	if (cfgfile_yesno(option, value, _T("map_drives_auto"), &p->automount_removable))
 		return 1;
 	if (cfgfile_yesno(option, value, _T("map_cd_drives"), &p->automount_cddrives))
+		return 1;
+	if (cfgfile_yesno(option, value, _T("alt_tab_release"), &p->alt_tab_release))
 		return 1;
 	if (cfgfile_yesno(option, value, _T("use_retroarch_quit"), &p->use_retroarch_quit))
 		return 1;
@@ -3029,9 +3042,11 @@ bool get_plugin_path(TCHAR* out, int len, const TCHAR* path)
 		out[len - 1] = '\0';
 	}
 	else {
-		write_log("\n-----------------> STUB: get_plugin_path, "
-			"size: %d, path: %s\n", len, path);
-		out[0] = '\0';
+		strncpy(out, start_path_data, len - 1);
+		strncat(out, "/", len - 1);
+		strncat(out, path, len - 1);
+		strncat(out, "/", len - 1);
+		return my_existsfile(out);
 	}
 	return TRUE;
 }

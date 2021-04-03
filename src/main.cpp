@@ -59,6 +59,7 @@
 #include <sys/ioctl.h>
 #include "keyboard.h"
 
+static const char __ver[40] = "$VER: Amiberry 4.x beta (2021-04-02)";
 long int version = 256 * 65536L * UAEMAJOR + 65536L * UAEMINOR + UAESUBREV;
 
 struct uae_prefs currprefs, changed_prefs;
@@ -301,6 +302,11 @@ void fixup_cpu (struct uae_prefs *p)
 	if (p->cpu_data_cache && (p->uaeboard != 3 && need_uae_boot_rom(p))) {
 		p->cpu_data_cache = false;
 		error_log(_T("Data cache emulation requires Indirect UAE Boot ROM."));
+	}
+
+	if (p->cpu_memory_cycle_exact && p->fast_copper != 0) {
+		p->fast_copper = 0;
+		error_log(_T("Cycle-exact mode not compatible with fast copper."));
 	}
 }
 

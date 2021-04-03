@@ -185,8 +185,9 @@ public:
 				changed_prefs.cachesize = 0;
 			}
 		}
-		
+		RefreshPanelCPU();
 		RefreshPanelQuickstart();
+		RefreshPanelChipset();
 	}
 };
 static CycleExactActionListener* cycleExactActionListener;
@@ -460,6 +461,8 @@ void RefreshPanelChipset()
 	chkNTSC->setSelected(changed_prefs.ntscmode);
 	chkCycleExact->setSelected(changed_prefs.cpu_cycle_exact);
 	chkMemoryCycleExact->setSelected(changed_prefs.cpu_memory_cycle_exact);
+	chkCycleExact->setEnabled(changed_prefs.cpu_model <= 68010);
+	chkMemoryCycleExact->setEnabled(changed_prefs.cpu_model <= 68010);
 
 	if (changed_prefs.immediate_blits)
 		optBlitImmed->setSelected(true);
@@ -468,7 +471,16 @@ void RefreshPanelChipset()
 	else
 		optBlitNormal->setSelected(true);
 
-	chkFastCopper->setSelected(changed_prefs.fast_copper);
+	if (changed_prefs.cpu_memory_cycle_exact)
+	{
+		chkFastCopper->setEnabled(false);
+		chkFastCopper->setSelected(false);
+	}
+	else
+	{
+		chkFastCopper->setEnabled(true);
+		chkFastCopper->setSelected(changed_prefs.fast_copper);
+	}
 
 	if (changed_prefs.collision_level == 0)
 		optCollNone->setSelected(true);

@@ -1415,6 +1415,7 @@ int check_prefs_changed_gfx()
 		currprefs.minimized_pause != changed_prefs.minimized_pause ||
 		currprefs.minimized_input != changed_prefs.minimized_input ||
 		currprefs.native_code != changed_prefs.native_code ||
+		currprefs.alt_tab_release != changed_prefs.alt_tab_release ||
 		currprefs.use_retroarch_quit != changed_prefs.use_retroarch_quit ||
 		currprefs.use_retroarch_menu != changed_prefs.use_retroarch_menu ||
 		currprefs.use_retroarch_reset != changed_prefs.use_retroarch_reset ||
@@ -1442,6 +1443,7 @@ int check_prefs_changed_gfx()
 		currprefs.minimized_pause = changed_prefs.minimized_pause;
 		currprefs.minimized_input = changed_prefs.minimized_input;
 		currprefs.native_code = changed_prefs.native_code;
+		currprefs.alt_tab_release = changed_prefs.alt_tab_release;
 		currprefs.use_retroarch_quit = changed_prefs.use_retroarch_quit;
 		currprefs.use_retroarch_menu = changed_prefs.use_retroarch_menu;
 		currprefs.use_retroarch_reset = changed_prefs.use_retroarch_reset;
@@ -2546,11 +2548,15 @@ void sortdisplays()
 				bitdepth == 16 ? RGBFB_R5G6B5 : RGBFB_R8G8B8A8;
 			auto pixelFormat = 1 << rgbFormat;
 			pixelFormat |= RGBFF_CHUNKY;
+			md->DisplayModes[count].rawmode = 0;
+			md->DisplayModes[count].lace = false;
 			md->DisplayModes[count].res.width = x_size_table[i];
 			md->DisplayModes[count].res.height = y_size_table[i];
 			md->DisplayModes[count].depth = bit_unit >> 3;
 			md->DisplayModes[count].refresh[0] = 50;
+			md->DisplayModes[count].refreshtype[0] = 0;
 			md->DisplayModes[count].refresh[1] = 60;
+			md->DisplayModes[count].refreshtype[1] = 0;
 			md->DisplayModes[count].refresh[2] = 0;
 			md->DisplayModes[count].colormodes = pixelFormat;
 			sprintf(md->DisplayModes[count].name, "%dx%d, %d-bit",

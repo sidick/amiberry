@@ -16,7 +16,7 @@
 #include "traps.h"
 
 #define UAEMAJOR 4
-#define UAEMINOR 5
+#define UAEMINOR 0
 #define UAESUBREV 0
 
 #define MAX_AMIGADISPLAYS 4
@@ -933,6 +933,7 @@ struct uae_prefs
 	int input_device_match_mask;
 
 #ifdef AMIBERRY
+	bool alt_tab_release;
 	int sound_pullmode;
 	bool input_analog_remap;
 	bool use_retroarch_quit;
@@ -1063,6 +1064,33 @@ extern struct uae_prefs currprefs, changed_prefs;
 
 extern int machdep_init(void);
 extern void machdep_free(void);
+
+struct fsvdlg_vals
+{
+	struct uaedev_config_info ci;
+	int rdb;
+};
+
+struct hfdlg_vals
+{
+	struct uaedev_config_info ci;
+	bool original;
+	uae_u64 size;
+	uae_u32 dostype;
+	int forcedcylinders;
+	bool rdb;
+};
+extern struct fsvdlg_vals current_fsvdlg;
+extern struct hfdlg_vals current_hfdlg;
+
+extern void hardfile_testrdb (struct hfdlg_vals *hdf);
+extern void default_fsvdlg (struct fsvdlg_vals *f);
+extern void default_hfdlg (struct hfdlg_vals *f);
+STATIC_INLINE bool is_hdf_rdb (void)
+{
+	return current_hfdlg.ci.sectors == 0 && current_hfdlg.ci.surfaces == 0 && current_hfdlg.ci.reserved == 0;
+}
+extern void updatehdfinfo (bool force, bool defaults);
 
 #ifdef AMIBERRY
 struct amiberry_customised_layout

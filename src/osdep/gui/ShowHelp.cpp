@@ -20,7 +20,7 @@
 #endif
 
 #define DIALOG_WIDTH 760
-#define DIALOG_HEIGHT 420
+#define DIALOG_HEIGHT 440
 
 static bool dialog_finished = false;
 

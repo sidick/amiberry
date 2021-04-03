@@ -403,7 +403,7 @@ static void expamem_init_clear2 (void)
 static addrbank *expamem_init_last (void)
 {
 	expamem_init_clear2 ();
-	write_log (_T("Memory map after autoconfig:\n"));
+	//write_log (_T("Memory map after autoconfig:\n"));
 	//memory_map_dump ();
 	return NULL;
 }
@@ -4112,6 +4112,7 @@ void restore_expansion_finish(void)
 			ec->aci.doinit = true;
 		}
 	}
+	restore_cardno = 0;
 }
 
 

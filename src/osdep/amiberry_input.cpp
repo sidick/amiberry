@@ -180,11 +180,14 @@ int keyhack (int scancode, int pressed, int num)
 {
 	static unsigned char backslashstate, apostrophstate;
 	const Uint8* state = SDL_GetKeyboardState(NULL);
-	
-	// release mouse if TAB and ALT is pressed
-	if (pressed && state[SDL_SCANCODE_LALT] && scancode == SDL_SCANCODE_TAB) {
-		disablecapture();
-		return -1;
+
+	// release mouse if TAB and ALT is pressed (but only if option is enabled)
+	if (currprefs.alt_tab_release)
+	{
+		if (pressed && state[SDL_SCANCODE_LALT] && scancode == SDL_SCANCODE_TAB) {
+			disablecapture();
+			return -1;
+		}
 	}
 
 	if (!keyboard_german)
@@ -659,6 +662,10 @@ static int init_joystick()
 	char cfg[MAX_DPATH];
 	get_configuration_path(cfg, MAX_DPATH);
 	strcat(cfg, "gamecontrollerdb.txt");
+	SDL_GameControllerAddMappingsFromFile(cfg);
+
+	get_controllers_path(cfg, MAX_DPATH);
+	strcat(cfg, "gamecontrollerdb_user.txt");
 	SDL_GameControllerAddMappingsFromFile(cfg);
 	
 	// Possible scenarios:
