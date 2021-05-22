@@ -27,26 +27,23 @@
 #define MAXVPOS_LINES_OCS 512
 #define HPOS_SHIFT 3
 
-#define BLIT_NASTY_CPU_STEAL_CYCLE_COUNT 4
+#define BLIT_NASTY_CPU_STEAL_CYCLE_COUNT 3
 
-uae_u32 get_copper_address (int copno);
+uae_u32 get_copper_address(int copno);
 
-extern int custom_init (void);
-extern void custom_prepare (void);
-extern void custom_reset (bool hardreset, bool keyboardreset);
-extern int intlev (void);
-extern void dumpcustom (void);
+extern int custom_init(void);
+extern void custom_prepare(void);
+extern void custom_reset(bool hardreset, bool keyboardreset);
+extern int intlev(void);
+extern void dumpcustom(void);
 
-extern void do_copper (void);
-#ifdef AMIBERRY
-extern void check_copperlist_write(uaecptr addr);
-#endif
+extern void do_copper(void);
 
-extern void notice_new_xcolors (void);
+extern void notice_new_xcolors(void);
 extern void notice_screen_contents_lost(int monid);
-extern void init_row_map (void);
-extern void init_hz_normal (void);
-extern void init_custom (void);
+extern void init_row_map(void);
+extern void init_hz_normal(void);
+extern void init_custom(void);
 
 extern void set_picasso_hack_rate(int hz);
 
@@ -62,7 +59,7 @@ extern int vpos, lof_store;
 
 extern int n_frames;
 
-STATIC_INLINE int dmaen (unsigned int dmamask)
+STATIC_INLINE int dmaen(unsigned int dmamask)
 {
 	return (dmamask & dmacon) && (dmacon & 0x200);
 }
@@ -148,14 +145,14 @@ extern bool programmedmode;
 #define DMA_MASTER    0x0200
 #define DMA_BLITPRI   0x0400
 
-#define CYCLE_REFRESH	1
-#define CYCLE_STROBE	2
-#define CYCLE_MISC		3
-#define CYCLE_SPRITE	4
-#define CYCLE_COPPER	5
-#define CYCLE_BLITTER	6
-#define CYCLE_CPU		7
-#define CYCLE_CPUNASTY	8
+#define CYCLE_BITPLANE  1
+#define CYCLE_REFRESH	2
+#define CYCLE_STROBE	3
+#define CYCLE_MISC		4
+#define CYCLE_SPRITE	5
+#define CYCLE_COPPER	6
+#define CYCLE_BLITTER	7
+#define CYCLE_CPU		8
 #define CYCLE_COPPER_SPECIAL 0x10
 
 #define CYCLE_MASK 0x0f
@@ -163,13 +160,12 @@ extern bool programmedmode;
 extern unsigned long frametime, timeframes;
 extern uae_u16 htotal, vtotal, beamcon0;
 
-/* 100 words give you 1600 horizontal pixels. Should be more than enough for
-* superhires. Don't forget to update the definition in genp2c.c as well.
-* needs to be larger for superhires support */
+// 100 words give you 1600 horizontal pixels. Should be more than enough for superhires. 
+// must be divisible by 8
 #ifdef CUSTOM_SIMPLE
-#define MAX_WORDS_PER_LINE 50
+#define MAX_WORDS_PER_LINE 56
 #else
-#define MAX_WORDS_PER_LINE 100
+#define MAX_WORDS_PER_LINE 104
 #endif
 
 extern uae_u32 hirestab_h[256][2];
@@ -199,13 +195,13 @@ extern int xbluecolor_s, xbluecolor_b, xbluecolor_m;
 #define RES_SHIFT(res) ((res) == RES_LORES ? 8 : (res) == RES_HIRES ? 4 : 2)
 
 /* get resolution from bplcon0 */
-STATIC_INLINE int GET_RES_DENISE (uae_u16 con0)
+STATIC_INLINE int GET_RES_DENISE(uae_u16 con0)
 {
 	if (!(currprefs.chipset_mask & CSMASK_ECS_DENISE))
 		con0 &= ~0x40; // SUPERHIRES
 	return ((con0) & 0x40) ? RES_SUPERHIRES : ((con0) & 0x8000) ? RES_HIRES : RES_LORES;
 }
-STATIC_INLINE int GET_RES_AGNUS (uae_u16 con0)
+STATIC_INLINE int GET_RES_AGNUS(uae_u16 con0)
 {
 	if (!(currprefs.chipset_mask & CSMASK_ECS_AGNUS))
 		con0 &= ~0x40; // SUPERHIRES
@@ -223,7 +219,7 @@ STATIC_INLINE int GET_PLANES(uae_u16 bplcon0)
 	return (bplcon0 >> 12) & 7; // normal planes bits
 }
 
-extern void fpscounter_reset (void);
+extern void fpscounter_reset(void);
 extern unsigned long idletime;
 extern int lightpen_x[2], lightpen_y[2];
 extern int lightpen_cx[2], lightpen_cy[2], lightpen_active, lightpen_enabled, lightpen_enabled2;
@@ -232,18 +228,42 @@ struct customhack {
 	uae_u16 v;
 	int vpos, hpos;
 };
-void customhack_put (struct customhack *ch, uae_u16 v, int hpos);
-uae_u16 customhack_get (struct customhack *ch, int hpos);
-extern void alloc_cycle_ext (int, int);
-extern void alloc_cycle_blitter (int hpos, uaecptr *ptr, int);
-extern bool ispal (void);
-extern bool isvga (void);
-extern int current_maxvpos (void);
-extern struct chipset_refresh *get_chipset_refresh (struct uae_prefs*);
-extern void compute_framesync (void);
+void customhack_put(struct customhack *ch, uae_u16 v, int hpos);
+uae_u16 customhack_get(struct customhack *ch, int hpos);
+extern void alloc_cycle_ext(int, int);
+extern void alloc_cycle_blitter(int hpos, uaecptr *ptr, int);
+extern bool ispal(void);
+extern bool isvga(void);
+extern int current_maxvpos(void);
+extern struct chipset_refresh *get_chipset_refresh(struct uae_prefs*);
+extern void compute_framesync(void);
 extern void getsyncregisters(uae_u16 *phsstrt, uae_u16 *phsstop, uae_u16 *pvsstrt, uae_u16 *pvsstop);
-int is_bitplane_dma (int hpos);
+bool blitter_cant_access(int hpos);
 void custom_cpuchange(void);
+bool bitplane_dma_access(int hpos, int offset);
+
+#define RGA_PIPELINE_ADJUST 4
+#define MAX_CHIPSETSLOTS 256
+extern uae_u8 cycle_line_slot[MAX_CHIPSETSLOTS + RGA_PIPELINE_ADJUST];
+extern uae_u16 cycle_line_pipe[MAX_CHIPSETSLOTS + RGA_PIPELINE_ADJUST];
+
+#define CYCLE_PIPE_CPUSTEAL 0x8000
+#define CYCLE_PIPE_BLITTER 0x100
+#define CYCLE_PIPE_COPPER 0x80
+#define CYCLE_PIPE_SPRITE 0x40
+#define CYCLE_PIPE_BITPLANE 0x20
+#define CYCLE_PIPE_MODULO 0x10
+
+#define RGA_PIPELINE_MASK 255
+
+#define RGA_PIPELINE_OFFSET_BLITTER 1
+
+extern int rga_pipeline_blitter;
+
+STATIC_INLINE int get_rga_pipeline(int hpos, int off)
+{
+	return (hpos + off) % maxhpos;
+}
 
 struct custom_store
 {

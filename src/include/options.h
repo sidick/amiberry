@@ -16,7 +16,7 @@
 #include "traps.h"
 
 #define UAEMAJOR 4
-#define UAEMINOR 0
+#define UAEMINOR 2
 #define UAESUBREV 0
 
 #define MAX_AMIGADISPLAYS 4
@@ -100,7 +100,7 @@ struct inputdevconfig
 struct jport
 {
 	int id{};
-	int mode{}; // 0=def,1=mouse,2=joy,3=anajoy,4=lightpen
+	int mode{}; // 0=default,1=wheel mouse,2=mouse,3=joystick,4=gamepad,5=analog joystick,6=cdtv,7=cd32
 	int submode;
 	int autofire{};
 	struct inputdevconfig idc{};
@@ -738,10 +738,12 @@ struct uae_prefs
 	bool cs_color_burst;
 	bool cs_romisslow;
 	bool cs_toshibagary;
+	bool cs_bkpthang;
 	int cs_unmapped_space;
 	int cs_hacks;
 	int cs_ciatype[2];
 	int cs_kbhandshake;
+	bool cs_ocshsyncbug;
 
 	struct boardromconfig expansionboard[MAX_EXPANSION_BOARDS];
 
