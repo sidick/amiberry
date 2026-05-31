@@ -126,6 +126,6 @@ jobs:
           EOF
           )
           gh release create "$TAG" "$APK_PATH" \
-            --title "Android $VERSION" \
+            --title "Amiberry $VERSION" \
             --notes "$NOTES" \
             --target "$COMMIT_SHA"
