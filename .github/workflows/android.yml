@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build-android:
@@ -63,15 +63,69 @@ jobs:
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "ndk;${NDK_VERSION}" "cmake;${CMAKE_VERSION}"
 
+      - name: Install committed debug keystore
+        run: |
+          mkdir -p "$HOME/.android"
+          cp android/debug.keystore "$HOME/.android/debug.keystore"
+
+      - name: Compute release version
+        id: version
+        run: |
+          DATE=$(date -u +%Y.%m.%d)
+          VERSION="${DATE}.${{ github.run_number }}"
+          TAG="android-v${VERSION}"
+          APK_NAME="amiberry-android-${VERSION}.apk"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}"         >> "$GITHUB_OUTPUT"
+          echo "apk_name=${APK_NAME}" >> "$GITHUB_OUTPUT"
+          echo "Release version: ${VERSION}"
+          echo "Release tag:     ${TAG}"
+          echo "APK filename:    ${APK_NAME}"
+
       - name: Build APK
         working-directory: android
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon
 
-      - name: Upload APK
+      - name: Stage APK with release filename
+        id: stage
+        run: |
+          SRC=$(ls android/app/build/outputs/apk/debug/*.apk | head -n1)
+          if [ -z "$SRC" ]; then
+            echo "No APK produced by Gradle build" >&2
+            exit 1
+          fi
+          mkdir -p release-assets
+          DEST="release-assets/${{ steps.version.outputs.apk_name }}"
+          cp "$SRC" "$DEST"
+          echo "apk_path=${DEST}" >> "$GITHUB_OUTPUT"
+          ls -lh "$DEST"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: amiberry-android-debug
-          path: android/app/build/outputs/apk/debug/*.apk
+          name: amiberry-android-${{ steps.version.outputs.version }}
+          path: ${{ steps.stage.outputs.apk_path }}
           if-no-files-found: error
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          APK_PATH: ${{ steps.stage.outputs.apk_path }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          NOTES=$(cat <<EOF
+          Automated Android debug build from \`${COMMIT_SHA}\`.
+
+          Signed with the committed debug keystore so updates install cleanly via [Obtainium](https://obtainium.imranr.dev/).
+
+          **Obtainium setup:** add this repository as a GitHub source — Obtainium will pick up the APK from each new release.
+          EOF
+          )
+          gh release create "$TAG" "$APK_PATH" \
+            --title "Android $VERSION" \
+            --notes "$NOTES" \
+            --target "$COMMIT_SHA"

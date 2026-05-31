@@ -147,6 +147,9 @@ Brewfile.lock.json
 /android/keystore.properties
 *.keystore
 *.jks
+# Exception: committed debug keystore used by Android CI (Obtainium needs a
+# stable signature across release builds).
+!/android/debug.keystore
 /android/.gradle/
 /android/build/
 /android/app/build/

@@ -27,6 +27,9 @@ Thumbs.db
 # Signing files
 *.jks
 *.keystore
+# Exception: the committed debug keystore used by Android CI so Obtainium
+# installs share a stable signature across release builds.
+!debug.keystore
 
 # Firebase config (contains project-specific API keys)
 google-services.json
