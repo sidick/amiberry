@@ -741,55 +741,97 @@ static void genmovemle(uae_u16 opcode) {
 	genamode(table68k[opcode].dmode, "dstreg", table68k[opcode].size, "src", 2,
 			1);
 
+	if (table68k[opcode].dmode == Apdi) {
+		comprintf("\tif (!special_mem && !(mask & (1 << (7 - dstreg)))) {\n");
+		comprintf("\t\tget_n_addr(srca,native);\n");
+		comprintf("\t\tfor (i=0;i<16;i++) {\n"
+				"\t\t\tif ((mask>>i)&1) {\n");
+		switch (table68k[opcode].size) {
+		case sz_long:
+			comprintf("\t\t\t\toffset-=4;\n"
+					"\t\t\t\tmov_l_rr(tmp,15-i);\n"
+					"\t\t\t\tmid_bswap_32(tmp);\n"
+					"\t\t\t\tmov_l_Rr(native,tmp,offset);\n");
+			break;
+		case sz_word:
+			comprintf("\t\t\t\toffset-=2;\n"
+					"\t\t\t\tmov_l_rr(tmp,15-i);\n"
+					"\t\t\t\tmid_bswap_16(tmp);\n"
+					"\t\t\t\tmov_w_Rr(native,tmp,offset);\n");
+			break;
+		default:
+			assert(0);
+			break;
+		}
+		comprintf("\t\t\t}\n"
+				"\t\t}\n");
+		comprintf("\t\tlea_l_brr(8+dstreg,srca,(uae_s32)offset);\n");
+		comprintf("\t} else {\n");
+		switch (table68k[opcode].size) {
+		case sz_long:
+			comprintf("\t\tint base=scratchie++;\n"
+					"\t\tlea_l_brr(base,srca,-4);\n");
+			break;
+		case sz_word:
+			comprintf("\t\tint base=scratchie++;\n"
+					"\t\tlea_l_brr(base,srca,-2);\n");
+			break;
+		default:
+			assert(0);
+			break;
+		}
+		comprintf("\t\tfor (i=0;i<16;i++) {\n"
+				"\t\t\tif ((mask>>i)&1) {\n");
+		switch (table68k[opcode].size) {
+		case sz_long:
+			comprintf("\t\t\t\tint value=15-i;\n"
+					"\t\t\t\tsub_l_ri(srca,4);\n"
+					"\t\t\t\tif (value == srca)\n"
+					"\t\t\t\t\tvalue=base;\n"
+					"\t\t\t\twritelong(srca,value);\n");
+			break;
+		case sz_word:
+			comprintf("\t\t\t\tint value=15-i;\n"
+					"\t\t\t\tsub_l_ri(srca,2);\n"
+					"\t\t\t\tif (value == srca)\n"
+					"\t\t\t\t\tvalue=base;\n"
+					"\t\t\t\twriteword(srca,value);\n");
+			break;
+		default:
+			assert(0);
+			break;
+		}
+		comprintf("\t\t\t}\n"
+				"\t\t}\n");
+		comprintf("\t\tmov_l_rr(8+dstreg,srca);\n");
+		comprintf("\t}\n");
+		return;
+	}
+
 	comprintf("\tget_n_addr(srca,native);\n");
 
-	if (table68k[opcode].dmode != Apdi) {
-		comprintf("\tfor (i=0;i<16;i++) {\n"
-				"\t\tif ((mask>>i)&1) {\n");
-		switch (table68k[opcode].size) {
-		case sz_long:
-			comprintf("\t\t\tmov_l_rr(tmp,i);\n"
-					"\t\t\tmid_bswap_32(tmp);\n"
-					"\t\t\tmov_l_Rr(native,tmp,offset);\n"
-					"\t\t\toffset+=4;\n");
-			break;
-		case sz_word:
-			comprintf("\t\t\tmov_l_rr(tmp,i);\n"
-					"\t\t\tmid_bswap_16(tmp);\n"
-					"\t\t\tmov_w_Rr(native,tmp,offset);\n"
-					"\t\t\toffset+=2;\n");
-			break;
-		default:
-			assert(0);
-			break;
-		}
-	} else { /* Pre-decrement */
-		comprintf("\tfor (i=0;i<16;i++) {\n"
-				"\t\tif ((mask>>i)&1) {\n");
-		switch (table68k[opcode].size) {
-		case sz_long:
-			comprintf("\t\t\toffset-=4;\n"
-					"\t\t\tmov_l_rr(tmp,15-i);\n"
-					"\t\t\tmid_bswap_32(tmp);\n"
-					"\t\t\tmov_l_Rr(native,tmp,offset);\n");
-			break;
-		case sz_word:
-			comprintf("\t\t\toffset-=2;\n"
-					"\t\t\tmov_l_rr(tmp,15-i);\n"
-					"\t\t\tmid_bswap_16(tmp);\n"
-					"\t\t\tmov_w_Rr(native,tmp,offset);\n");
-			break;
-		default:
-			assert(0);
-			break;
-		}
+	comprintf("\tfor (i=0;i<16;i++) {\n"
+			"\t\tif ((mask>>i)&1) {\n");
+	switch (table68k[opcode].size) {
+	case sz_long:
+		comprintf("\t\t\tmov_l_rr(tmp,i);\n"
+				"\t\t\tmid_bswap_32(tmp);\n"
+				"\t\t\tmov_l_Rr(native,tmp,offset);\n"
+				"\t\t\toffset+=4;\n");
+		break;
+	case sz_word:
+		comprintf("\t\t\tmov_l_rr(tmp,i);\n"
+				"\t\t\tmid_bswap_16(tmp);\n"
+				"\t\t\tmov_w_Rr(native,tmp,offset);\n"
+				"\t\t\toffset+=2;\n");
+		break;
+	default:
+		assert(0);
+		break;
 	}
 
 	comprintf("\t\t}\n"
 			"\t}");
-	if (table68k[opcode].dmode == Apdi) {
-		comprintf("\t\t\tlea_l_brr(8+dstreg,srca,(uae_s32)offset);\n");
-	}
 }
 
 static void duplicate_carry(void) {
@@ -3078,12 +3120,24 @@ static void gen_mull(uae_u32 opcode, struct instr *curi, const char* ssize) {
 	if (!noflags) {
 		comprintf("\t if (extra & 0x0400) {\n"); /* Need full 64 bit result */
 		comprintf("\t   int r3=(extra & 7);\n");
-		comprintf("\t   mov_l_rr(r3,dst);\n"); /* operands now in r3 and r2 */
-		comprintf("\t   if (extra & 0x0800) { \n"); /* signed */
-		comprintf("\t\t	  jff_MULS64(r2,r3);\n");
-		comprintf("\t	} else { \n");
-		comprintf("\t\t	  jff_MULU64(r2,r3);\n");
-		comprintf("\t	} \n"); /* The result is in r2/r3, with r2 holding the lower 32 bits */
+		comprintf("\t   if (r2 == r3) {\n");
+		comprintf("\t     mov_l_rr(tmp,r2);\n");
+		comprintf("\t     mov_l_rr(r3,dst);\n"); /* operands now in r3 and tmp */
+		comprintf("\t     if (extra & 0x0800) { \n"); /* signed */
+		comprintf("\t       jff_MULS64(tmp,r3);\n");
+		comprintf("\t     } else { \n");
+		comprintf("\t       jff_MULU64(tmp,r3);\n");
+		comprintf("\t     } \n");
+		comprintf("\t     if (currprefs.cpu_model >= 68040)\n");
+		comprintf("\t       mov_l_rr(r2,tmp);\n");
+		comprintf("\t   } else {\n");
+		comprintf("\t     mov_l_rr(r3,dst);\n"); /* operands now in r3 and r2 */
+		comprintf("\t     if (extra & 0x0800) { \n"); /* signed */
+		comprintf("\t       jff_MULS64(r2,r3);\n");
+		comprintf("\t     } else { \n");
+		comprintf("\t       jff_MULU64(r2,r3);\n");
+		comprintf("\t     } \n"); /* The result is in r2/r3, with r2 holding the lower 32 bits */
+		comprintf("\t   }\n");
 		comprintf("\t } else {\n"); /* Only want 32 bit result */
 		/* operands in dst and r2, result goes into r2 */
 		/* shouldn't matter whether it's signed or unsigned?!? */
@@ -3096,12 +3150,24 @@ static void gen_mull(uae_u32 opcode, struct instr *curi, const char* ssize) {
 	} else {
 		comprintf("\t if (extra & 0x0400) {\n"); /* Need full 64 bit result */
 		comprintf("\t   int r3=(extra & 7);\n");
-		comprintf("\t   mov_l_rr(r3,dst);\n"); /* operands now in r3 and r2 */
-		comprintf("\t   if (extra & 0x0800) { \n"); /* signed */
-		comprintf("\t\t	  jnf_MULS64(r2,r3);\n");
-		comprintf("\t	} else { \n");
-		comprintf("\t\t	  jnf_MULU64(r2,r3);\n");
-		comprintf("\t	} \n"); /* The result is in r2/r3, with r2 holding the lower 32 bits */
+		comprintf("\t   if (r2 == r3) {\n");
+		comprintf("\t     mov_l_rr(tmp,r2);\n");
+		comprintf("\t     mov_l_rr(r3,dst);\n"); /* operands now in r3 and tmp */
+		comprintf("\t     if (extra & 0x0800) { \n"); /* signed */
+		comprintf("\t       jnf_MULS64(tmp,r3);\n");
+		comprintf("\t     } else { \n");
+		comprintf("\t       jnf_MULU64(tmp,r3);\n");
+		comprintf("\t     } \n");
+		comprintf("\t     if (currprefs.cpu_model >= 68040)\n");
+		comprintf("\t       mov_l_rr(r2,tmp);\n");
+		comprintf("\t   } else {\n");
+		comprintf("\t     mov_l_rr(r3,dst);\n"); /* operands now in r3 and r2 */
+		comprintf("\t     if (extra & 0x0800) { \n"); /* signed */
+		comprintf("\t       jnf_MULS64(r2,r3);\n");
+		comprintf("\t     } else { \n");
+		comprintf("\t       jnf_MULU64(r2,r3);\n");
+		comprintf("\t     } \n"); /* The result is in r2/r3, with r2 holding the lower 32 bits */
+		comprintf("\t   }\n");
 		comprintf("\t } else {\n"); /* Only want 32 bit result */
 		/* operands in dst and r2, result foes into r2 */
 		/* shouldn't matter whether it's signed or unsigned?!? */

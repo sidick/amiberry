@@ -22,6 +22,7 @@
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <vector>
 
 #include "sysdeps.h"
 #include "options.h"
@@ -151,6 +152,8 @@ static int pending_mousecapture_active;
 // recapture on focus_gained and the window-position snap-back heuristic
 // so that release sticks until the user clicks back inside the window.
 static bool user_released_capture;
+static bool suppress_capture_click_release;
+static SDL_MouseID suppress_capture_click_mouse_id;
 int mouseactive;
 int mouse_monid;
 int minimized;
@@ -973,7 +976,7 @@ void setsoundpaused()
 #endif
 }
 
-bool resumepaused(const int priority)
+static bool resumepaused_internal(const int priority, const bool restorecapture)
 {
 	const AmigaMonitor* mon = &AMonitors[0];
 	if (pause_emulation > priority)
@@ -987,12 +990,23 @@ bool resumepaused(const int priority)
 		pausemouseactive = 0;
 		// In Amiberry, we'll do this for Full Window and Fullscreen both.
 		// Otherwise, KMSDRM did not get the focus after resuming from the GUI
-		setmouseactive(mon->monitor_id, isfullscreen() != 0 ? 1 : -1);
+		if (restorecapture)
+			setmouseactive(mon->monitor_id, isfullscreen() != 0 ? 1 : -1);
 	}
 	pause_emulation = 0;
 	setsystime();
 	wait_keyrelease();
 	return true;
+}
+
+bool resumepaused(const int priority)
+{
+	return resumepaused_internal(priority, true);
+}
+
+bool resumepaused_without_mouse_capture(const int priority)
+{
+	return resumepaused_internal(priority, false);
 }
 
 bool setpaused(const int priority)
@@ -1006,9 +1020,8 @@ bool setpaused(const int priority)
 	pause_emulation = priority;
 	devices_pause();
 	setsoundpaused();
-	pausemouseactive = 1;
+	pausemouseactive = mouseactive;
 	if (isfullscreen() <= 0) {
-		pausemouseactive = mouseactive;
 		setmouseactive(mon->monitor_id, 0);
 	}
 	return true;
@@ -1169,11 +1182,25 @@ static bool apply_mouse_capture_grabs(AmigaMonitor*) { return true; }
 
 void releasecapture(const AmigaMonitor* mon)
 {
-	SDL_SetWindowMouseGrab(mon->amiga_window, false);
-	SDL_SetWindowKeyboardGrab(mon->amiga_window, false);
-	SDL_SetWindowRelativeMouseMode(mon->amiga_window, false);
+	if (mon && mon->amiga_window) {
+		SDL_SetWindowMouseGrab(mon->amiga_window, false);
+		SDL_SetWindowKeyboardGrab(mon->amiga_window, false);
+		SDL_SetWindowRelativeMouseMode(mon->amiga_window, false);
+	}
 	set_showcursor(TRUE);
 	mon_cursorclipped = 0;
+}
+
+static void releasecapture_state_only()
+{
+	AmigaMonitor* mon = &AMonitors[0];
+	if (mouseactive > 0 && mouseactive <= MAX_AMIGAMONITORS)
+		mon = &AMonitors[mouseactive - 1];
+	releasecapture(mon);
+	mouseactive = 0;
+	recapture = 0;
+	suppress_capture_click_release = false;
+	clear_pending_mouse_capture();
 }
 
 static void restore_active_mouse_capture(AmigaMonitor* mon)
@@ -1246,14 +1273,19 @@ bool ismouseactive ()
 	return mouseactive > 0;
 }
 
+static bool accepts_uncaptured_guest_input()
+{
+	return currprefs.input_tablet >= TABLET_MOUSEHACK
+		&& (currprefs.input_mouse_untrap & MOUSEUNTRAP_MAGIC)
+		&& mousehack_alive();
+}
+
 void target_inputdevice_unacquire(const bool full)
 {
-	const AmigaMonitor* mon = &AMonitors[0];
 	close_tablet(tablet);
 	tablet = NULL;
 	if (full) {
-		SDL_SetWindowMouseGrab(mon->amiga_window, false);
-		SDL_SetWindowKeyboardGrab(mon->amiga_window, false);
+		releasecapture_state_only();
 	}
 }
 void target_inputdevice_acquire()
@@ -1261,8 +1293,6 @@ void target_inputdevice_acquire()
 	const AmigaMonitor* mon = &AMonitors[0];
 	target_inputdevice_unacquire(false);
 	tablet = open_tablet(mon->amiga_window);
-	SDL_SetWindowMouseGrab(mon->amiga_window, true);
-	SDL_SetWindowKeyboardGrab(mon->amiga_window, !currprefs.alt_tab_release);
 }
 
 static void setmouseactive2(AmigaMonitor* mon, int active, const bool allowpause)
@@ -1276,8 +1306,15 @@ static void setmouseactive2(AmigaMonitor* mon, int active, const bool allowpause
 		return;
 	const int lastmouseactive = mouseactive;
 
-	if (active == 0)
-		releasecapture(mon);
+	if (active == 0) {
+		AmigaMonitor* capture_mon = mon;
+		if (lastmouseactive > 0 && lastmouseactive <= MAX_AMIGAMONITORS)
+			capture_mon = &AMonitors[lastmouseactive - 1];
+		releasecapture(capture_mon);
+		suppress_capture_click_release = false;
+		if (lastmouseactive)
+			wait_keyrelease();
+	}
 	if (mouseactive == active && active >= 0)
 		return;
 
@@ -1427,9 +1464,8 @@ static void amiberry_active(const AmigaMonitor* mon, const int is_minimized)
 	}
 	getcapslock();
 	wait_keyrelease();
-	if (isfullscreen() > 0 || (currprefs.capture_always && !user_released_capture)) {
+	if (!user_released_capture && (currprefs.capture_always || (isfullscreen() != 0 && !currprefs.start_uncaptured))) {
 		setmouseactive(mon->monitor_id, 1);
-		inputdevice_acquire(TRUE);
 	}
 	clipboard_active(1, 1);
 }
@@ -1537,6 +1573,12 @@ void disablecapture()
 		setsoundpaused();
 		sound_closed = -1;
 	}
+}
+
+void suppresscapture()
+{
+	user_released_capture = true;
+	clear_pending_mouse_capture();
 }
 
 void setmouseactivexy(const int monid, int x, int y, const int dir)
@@ -2447,57 +2489,8 @@ static void handle_joy_hat_motion_event(const SDL_Event& event)
 	}
 }
 
-static void handle_key_event(const SDL_Event& event)
+static int normalize_host_key_scancode(int scancode)
 {
-#ifdef __ANDROID__
-	// SDL3 traps the Android back button (SDL_HINT_ANDROID_TRAP_BACK_BUTTON=1)
-	// and delivers it as SDL_SCANCODE_AC_BACK.  Always open the GUI regardless
-	// of SDL window focus state.
-	if (event.key.scancode == SDL_SCANCODE_AC_BACK) {
-		if (event.key.down && !event.key.repeat) {
-			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
-		}
-		return;
-	}
-#endif
-
-	// Allow keyboard input if we have any focus level
-	const int focus_level = isfocus();
-	if (event.key.repeat || !focus_level)
-		return;
-	
-	// Only apply the virtual mouse focus restriction in windowed mode.
-	// In fullscreen/full-window modes (including KMSDRM console), keyboard should work
-	// because console mode never receives SDL_EVENT_WINDOW_MOUSE_ENTER, leaving mouseinside false.
-	if (isfullscreen() == 0 && focus_level < 2 && 
-		currprefs.input_tablet >= TABLET_MOUSEHACK && (currprefs.input_mouse_untrap & MOUSEUNTRAP_MAGIC))
-		return;
-
-	int scancode = event.key.scancode;
-	const auto pressed = event.key.down;
-
-	// Ctrl+Alt releases mouse capture (like QEMU). Works on trackpads
-	// where there is no middle mouse button available.
-	if (currprefs.ctrl_alt_release && pressed && mouseactive)
-	{
-		const bool* kbstate = SDL_GetKeyboardState(nullptr);
-		const bool ctrl_held = kbstate[SDL_SCANCODE_LCTRL] || kbstate[SDL_SCANCODE_RCTRL];
-		const bool alt_held = kbstate[SDL_SCANCODE_LALT] || kbstate[SDL_SCANCODE_RALT];
-		const bool is_ctrl = (scancode == SDL_SCANCODE_LCTRL || scancode == SDL_SCANCODE_RCTRL);
-		const bool is_alt = (scancode == SDL_SCANCODE_LALT || scancode == SDL_SCANCODE_RALT);
-
-		if ((is_ctrl && alt_held) || (is_alt && ctrl_held))
-		{
-			activationtoggle(0, true);
-			// Release both modifiers in the emulator so they don't stick
-			my_kbd_handler(0, SDL_SCANCODE_LCTRL, 0, true);
-			my_kbd_handler(0, SDL_SCANCODE_RCTRL, 0, true);
-			my_kbd_handler(0, SDL_SCANCODE_LALT, 0, true);
-			my_kbd_handler(0, SDL_SCANCODE_RALT, 0, true);
-			return;
-		}
-	}
-
 	if (key_swap_hack == 1) {
 		if (scancode == SDL_SCANCODE_F11) {
 			scancode = SDL_SCANCODE_BACKSLASH;
@@ -2525,6 +2518,113 @@ static void handle_key_event(const SDL_Event& event)
 	{
 		scancode = SDL_SCANCODE_RGUI;
 	}
+	return scancode;
+}
+
+static void apply_host_modifier_state(const int scancode,
+	bool& ctrl_state, bool& shift_state, bool& alt_state, bool& win_state)
+{
+	switch (scancode)
+	{
+	case SDL_SCANCODE_LCTRL:
+	case SDL_SCANCODE_RCTRL:
+		ctrl_state = true;
+		break;
+	case SDL_SCANCODE_LSHIFT:
+	case SDL_SCANCODE_RSHIFT:
+		shift_state = true;
+		break;
+	case SDL_SCANCODE_LALT:
+	case SDL_SCANCODE_RALT:
+		alt_state = true;
+		break;
+	case SDL_SCANCODE_LGUI:
+	case SDL_SCANCODE_RGUI:
+		win_state = true;
+		break;
+	default:
+		break;
+	}
+}
+
+static void get_host_hotkey_modifier_state(const int event_scancode, const bool pressed,
+	bool& ctrl_state, bool& shift_state, bool& alt_state, bool& win_state)
+{
+	ctrl_state = false;
+	shift_state = false;
+	alt_state = false;
+	win_state = false;
+
+	const bool* state = SDL_GetKeyboardState(nullptr);
+	for (int i = 0; i < SDL_SCANCODE_COUNT; ++i) {
+		if (state[i])
+			apply_host_modifier_state(normalize_host_key_scancode(i), ctrl_state, shift_state, alt_state, win_state);
+	}
+	if (pressed)
+		apply_host_modifier_state(event_scancode, ctrl_state, shift_state, alt_state, win_state);
+}
+
+static void handle_key_event(const SDL_Event& event)
+{
+#ifdef __ANDROID__
+	// SDL3 traps the Android back button (SDL_HINT_ANDROID_TRAP_BACK_BUTTON=1)
+	// and delivers it as SDL_SCANCODE_AC_BACK.  Always open the GUI regardless
+	// of SDL window focus state.
+	if (event.key.scancode == SDL_SCANCODE_AC_BACK) {
+		if (event.key.down && !event.key.repeat) {
+			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
+		}
+		return;
+	}
+#endif
+
+	// Allow keyboard input if we have any focus level
+	const int focus_level = isfocus();
+	if (event.key.repeat || !focus_level)
+		return;
+
+	int scancode = event.key.scancode;
+	const auto pressed = event.key.down;
+
+	// Ctrl+Alt releases mouse capture (like QEMU). Works on trackpads
+	// where there is no middle mouse button available.
+	if (currprefs.ctrl_alt_release && pressed && mouseactive)
+	{
+		const bool* kbstate = SDL_GetKeyboardState(nullptr);
+		const bool ctrl_held = kbstate[SDL_SCANCODE_LCTRL] || kbstate[SDL_SCANCODE_RCTRL];
+		const bool alt_held = kbstate[SDL_SCANCODE_LALT] || kbstate[SDL_SCANCODE_RALT];
+		const bool is_ctrl = (scancode == SDL_SCANCODE_LCTRL || scancode == SDL_SCANCODE_RCTRL);
+		const bool is_alt = (scancode == SDL_SCANCODE_LALT || scancode == SDL_SCANCODE_RALT);
+
+		if ((is_ctrl && alt_held) || (is_alt && ctrl_held))
+		{
+			activationtoggle(0, true);
+			// Release both modifiers in the emulator so they don't stick
+			my_kbd_handler(0, SDL_SCANCODE_LCTRL, 0, true);
+			my_kbd_handler(0, SDL_SCANCODE_RCTRL, 0, true);
+			my_kbd_handler(0, SDL_SCANCODE_LALT, 0, true);
+			my_kbd_handler(0, SDL_SCANCODE_RALT, 0, true);
+			return;
+		}
+	}
+
+	scancode = normalize_host_key_scancode(scancode);
+
+	if (!mouseactive) {
+		bool ctrl_state, shift_state, alt_state, win_state;
+		get_host_hotkey_modifier_state(scancode, pressed, ctrl_state, shift_state, alt_state, win_state);
+		if (my_kbd_host_hotkey_handler(scancode, pressed, ctrl_state, shift_state, alt_state, win_state)
+			|| !accepts_uncaptured_guest_input())
+			return;
+	}
+
+	// Only apply the virtual mouse focus restriction in windowed mode.
+	// In fullscreen/full-window modes (including KMSDRM console), keyboard should work
+	// because console mode never receives SDL_EVENT_WINDOW_MOUSE_ENTER, leaving mouseinside false.
+	if (isfullscreen() == 0 && focus_level < 2 &&
+		currprefs.input_tablet >= TABLET_MOUSEHACK && (currprefs.input_mouse_untrap & MOUSEUNTRAP_MAGIC))
+		return;
+
 	scancode = keyhack(scancode, pressed, 0);
 	if (scancode >= 0)
 	{
@@ -2599,7 +2699,7 @@ static void handle_android_two_finger_swipe(const SDL_Event& event)
 
 static void handle_finger_event(const SDL_Event& event)
 {
-	if (!isfocus())
+	if (!mouseactive || isfocus() <= 0)
 		return;
 #ifndef LIBRETRO
 	if (pen_in_proximity && currprefs.input_tablet > 0)
@@ -2644,14 +2744,28 @@ static void handle_mouse_button_event(const SDL_Event& event, const AmigaMonitor
 	const auto clicks = event.button.clicks;
 	const int midx = get_mouse_index_from_sdl_id(event.button.which);
 
+	if (suppress_capture_click_release && button == SDL_BUTTON_LEFT
+		&& event.button.which == suppress_capture_click_mouse_id) {
+		suppress_capture_click_release = false;
+		if (!state)
+			return;
+	}
+
 	if (button == SDL_BUTTON_LEFT && !mouseactive && (!mousehack_alive() || currprefs.input_tablet != TABLET_MOUSEHACK ||
 		(currprefs.input_tablet == TABLET_MOUSEHACK && !(currprefs.input_mouse_untrap & MOUSEUNTRAP_MAGIC))))
 	{
+		if (!state)
+			return;
 		mouseinside = true;
-		if (!pause_emulation || currprefs.active_nocapture_pause)
+		if (!pause_emulation || currprefs.active_nocapture_pause) {
 			setmouseactive(mon->monitor_id, (clicks == 1 || isfullscreen() > 0) ? 2 : 1);
+			if (mouseactive) {
+				suppress_capture_click_release = true;
+				suppress_capture_click_mouse_id = event.button.which;
+			}
+		}
 	}
-	else if (isfocus())
+	else if ((mouseactive || accepts_uncaptured_guest_input()) && isfocus() > 0)
 	{
 		switch (button)
 		{
@@ -2685,7 +2799,7 @@ static void handle_finger_motion_event(const SDL_Event& event)
 	if (pen_in_proximity && currprefs.input_tablet > 0)
 		return;
 #endif
-	if (isfocus() && event.tfinger.fingerID == 0)
+	if (mouseactive && isfocus() > 0 && event.tfinger.fingerID == 0)
 	{
 		// Use relative movement for better control (Laptop touchpad style)
 		// Scale normalized coords (0..1) to window pixels
@@ -2720,7 +2834,7 @@ static void handle_mouse_motion_event(const SDL_Event& event, const AmigaMonitor
 		return;
 	}
 
-	if (isfocus() <= 0) return;
+	if ((!mouseactive && !accepts_uncaptured_guest_input()) || isfocus() <= 0) return;
 
 	const int midx = get_mouse_index_from_sdl_id(event.motion.which);
 
@@ -2789,7 +2903,7 @@ static int get_mouse_wheel_ticks(const SDL_MouseWheelEvent& wheel, const int mid
 
 static void handle_mouse_wheel_event(const SDL_Event& event)
 {
-	if (isfocus() <= 0) return;
+	if ((!mouseactive && !accepts_uncaptured_guest_input()) || isfocus() <= 0) return;
 
 	const int midx = get_mouse_index_from_sdl_id(event.wheel.which);
 	const int val_y = get_mouse_wheel_ticks(event.wheel, midx, 1);
@@ -4247,9 +4361,7 @@ bool target_execute(const char* command)
 	if (!command)
 		return false;
 
-	AmigaMonitor* mon = &AMonitors[0];
-	releasecapture(mon);
-	mouseactive = 0;
+	disablecapture();
 
 	write_log("Target_execute received: %s\n", command);
 	
@@ -4472,10 +4584,10 @@ void target_default_options(uae_prefs* p, const int type)
 		//p->commandpathstart[0] = 0;
 		//p->commandpathend[0] = 0;
 		//p->statusbar = 1;
-	#ifdef USE_VULKAN
-	p->gfx_api = 5;
+#ifdef USE_VULKAN
+		p->gfx_api = 5;
 #else
-	p->gfx_api = 4;
+		p->gfx_api = 4;
 #endif
 		if (p->gf[GF_NORMAL].gfx_filter == 0)
 			p->gf[GF_NORMAL].gfx_filter = 1;
@@ -8041,6 +8153,563 @@ static void migrate_legacy_lowercase_content_directories()
 		write_log("Directory case migration: completed (legacy names renamed to canonical names)\n");
 }
 
+static std::vector<visual_asset_path_set> get_legacy_visual_asset_candidates_for_current_state();
+
+struct legacy_configuration_path_rewrite_pair
+{
+	std::string legacy_path;
+	std::string canonical_path;
+};
+
+struct legacy_configuration_text_rewrite_rule
+{
+	std::string legacy_prefix;
+	std::string canonical_prefix;
+};
+
+static bool path_exists_quietly(const std::string& path)
+{
+	if (path.empty())
+		return false;
+
+	std::error_code ec;
+	return std::filesystem::exists(path, ec) && !ec;
+}
+
+static bool path_entry_exists_with_exact_name(const std::string& path)
+{
+	if (path.empty())
+		return false;
+
+	std::filesystem::path candidate(path);
+	while (!candidate.empty() && candidate.filename().empty())
+		candidate = candidate.parent_path();
+	if (candidate.empty())
+		return false;
+
+	const auto parent = candidate.parent_path();
+	const auto filename = candidate.filename().string();
+	if (parent.empty() || filename.empty())
+		return path_exists_quietly(candidate.string());
+	if (!path_exists_quietly(parent.string()))
+		return false;
+
+	std::error_code ec;
+	std::filesystem::directory_iterator iterator(parent, ec);
+	if (ec)
+		return false;
+
+	const std::filesystem::directory_iterator end;
+	for (; iterator != end; iterator.increment(ec))
+	{
+		if (ec)
+			return false;
+		if (iterator->path().filename().string() == filename)
+			return true;
+	}
+
+	return false;
+}
+
+static void append_unique_legacy_configuration_path_pair(
+	std::vector<legacy_configuration_path_rewrite_pair>& pairs,
+	const std::string& legacy_path,
+	const std::string& canonical_path)
+{
+	if (legacy_path.empty() || canonical_path.empty())
+		return;
+
+	const auto normalized_legacy = normalize_path_string(legacy_path);
+	const auto normalized_canonical = normalize_path_string(canonical_path);
+	if (normalized_legacy.empty() || normalized_canonical.empty())
+		return;
+	if (path_strings_match(normalized_legacy, normalized_canonical))
+		return;
+	if (!path_entry_exists_with_exact_name(normalized_canonical))
+		return;
+	if (path_entry_exists_with_exact_name(normalized_legacy))
+		return;
+
+	for (const auto& pair : pairs)
+	{
+		if (path_strings_match(pair.legacy_path, normalized_legacy)
+			&& path_strings_match(pair.canonical_path, normalized_canonical))
+		{
+			return;
+		}
+	}
+
+	pairs.push_back({normalized_legacy, normalized_canonical});
+}
+
+static void append_legacy_configuration_path_pairs_for_names(
+	std::vector<legacy_configuration_path_rewrite_pair>& pairs,
+	const std::string& canonical_path,
+	std::initializer_list<const char*> legacy_names)
+{
+	if (canonical_path.empty())
+		return;
+
+	std::filesystem::path canonical(canonical_path);
+	while (!canonical.empty() && canonical.filename().empty())
+		canonical = canonical.parent_path();
+	if (canonical.empty())
+		return;
+
+	const auto parent = canonical.parent_path();
+	if (parent.empty())
+		return;
+
+	for (const auto* legacy_name : legacy_names)
+	{
+		if (legacy_name == nullptr || legacy_name[0] == '\0')
+			continue;
+		append_unique_legacy_configuration_path_pair(pairs,
+			(parent / legacy_name).string(), canonical.string());
+	}
+}
+
+static void append_legacy_visual_configuration_path_pairs(
+	std::vector<legacy_configuration_path_rewrite_pair>& pairs,
+	const std::string& canonical_path,
+	std::initializer_list<const char*> legacy_visual_names,
+	std::initializer_list<const char*> legacy_asset_names)
+{
+	if (canonical_path.empty())
+		return;
+
+	std::filesystem::path canonical(canonical_path);
+	while (!canonical.empty() && canonical.filename().empty())
+		canonical = canonical.parent_path();
+	if (canonical.empty())
+		return;
+
+	const auto asset_parent = canonical.parent_path();
+	const auto visuals_parent = asset_parent.parent_path();
+	if (asset_parent.empty() || visuals_parent.empty())
+		return;
+
+	for (const auto* visual_name : legacy_visual_names)
+	{
+		for (const auto* asset_name : legacy_asset_names)
+		{
+			if (visual_name == nullptr || asset_name == nullptr
+				|| visual_name[0] == '\0' || asset_name[0] == '\0')
+			{
+				continue;
+			}
+			append_unique_legacy_configuration_path_pair(pairs,
+				(visuals_parent / visual_name / asset_name).string(), canonical.string());
+		}
+	}
+}
+
+static std::vector<legacy_configuration_path_rewrite_pair>
+build_legacy_configuration_path_rewrite_pairs(const base_content_path_set& paths)
+{
+	std::vector<legacy_configuration_path_rewrite_pair> pairs;
+
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.config_path,
+		{"conf", "configurations"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.controllers_path,
+		{"controllers"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.whdboot_path,
+		{"Whdboot", "whdboot"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.whdload_arch_path,
+		{"Lha", "lha"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.floppy_path,
+		{"floppies"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.harddrive_path,
+		{"Harddrives", "harddrives"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.cdrom_path,
+		{"cdroms"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.logfile_path,
+		{"amiberry.log"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.rom_path,
+		{"Roms", "roms"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.rp9_path,
+		{"rp9"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.savestate_dir,
+		{"Savestates", "savestates"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.ripper_path,
+		{"ripper"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.input_dir,
+		{"Inputrecordings", "inputrecordings"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.screenshot_dir,
+		{"screenshots"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.nvram_dir,
+		{"Nvram", "nvram"});
+	append_legacy_configuration_path_pairs_for_names(pairs, paths.video_dir,
+		{"videos"});
+
+	append_legacy_visual_configuration_path_pairs(pairs, paths.themes_path,
+		{"visuals", "Visuals"}, {"themes", "Themes"});
+	append_legacy_visual_configuration_path_pairs(pairs, paths.shaders_path,
+		{"visuals", "Visuals"}, {"shaders", "Shaders"});
+	append_legacy_visual_configuration_path_pairs(pairs, paths.bezels_path,
+		{"visuals", "Visuals"}, {"bezels", "Bezels"});
+
+	for (const auto& legacy_visual_paths : get_legacy_visual_asset_candidates_for_current_state())
+	{
+		append_unique_legacy_configuration_path_pair(pairs, legacy_visual_paths.themes_path, paths.themes_path);
+		append_unique_legacy_configuration_path_pair(pairs, legacy_visual_paths.shaders_path, paths.shaders_path);
+		append_unique_legacy_configuration_path_pair(pairs, legacy_visual_paths.bezels_path, paths.bezels_path);
+	}
+
+	return pairs;
+}
+
+static void append_unique_legacy_configuration_text_rule(
+	std::vector<legacy_configuration_text_rewrite_rule>& rules,
+	const std::string& legacy_prefix,
+	const std::string& canonical_prefix)
+{
+	if (legacy_prefix.empty() || canonical_prefix.empty() || legacy_prefix == canonical_prefix)
+		return;
+
+	for (const auto& rule : rules)
+	{
+		if (rule.legacy_prefix == legacy_prefix && rule.canonical_prefix == canonical_prefix)
+			return;
+	}
+
+	rules.push_back({legacy_prefix, canonical_prefix});
+}
+
+static void append_legacy_configuration_text_path_rule(
+	std::vector<legacy_configuration_text_rewrite_rule>& rules,
+	const std::filesystem::path& legacy_path,
+	const std::filesystem::path& canonical_path)
+{
+	const auto legacy_normalized = legacy_path.lexically_normal();
+	const auto canonical_normalized = canonical_path.lexically_normal();
+
+	append_unique_legacy_configuration_text_rule(rules,
+		legacy_normalized.string(), canonical_normalized.string());
+	append_unique_legacy_configuration_text_rule(rules,
+		legacy_normalized.generic_string(), canonical_normalized.generic_string());
+}
+
+static void append_legacy_configuration_relative_text_rules(
+	std::vector<legacy_configuration_text_rewrite_rule>& rules,
+	const legacy_configuration_path_rewrite_pair& pair,
+	const std::filesystem::path& config_file_parent)
+{
+	const std::filesystem::path legacy_path(pair.legacy_path);
+	const std::filesystem::path canonical_path(pair.canonical_path);
+
+	append_legacy_configuration_text_path_rule(rules, legacy_path, canonical_path);
+
+	if (!config_file_parent.empty())
+	{
+		const auto legacy_relative = legacy_path.lexically_relative(config_file_parent);
+		const auto canonical_relative = canonical_path.lexically_relative(config_file_parent);
+		if (!legacy_relative.empty() && !canonical_relative.empty()
+			&& legacy_relative != "." && canonical_relative != ".")
+		{
+			append_legacy_configuration_text_path_rule(rules, legacy_relative, canonical_relative);
+		}
+	}
+
+	if (path_strings_match(legacy_path.parent_path().string(), canonical_path.parent_path().string()))
+	{
+		append_legacy_configuration_text_path_rule(rules,
+			std::filesystem::path(".") / legacy_path.filename(),
+			std::filesystem::path(".") / canonical_path.filename());
+	}
+}
+
+static bool is_configuration_path_prefix_start_boundary(const std::string& text, const std::size_t offset)
+{
+	if (offset == 0)
+		return true;
+
+	const auto previous = static_cast<unsigned char>(text[offset - 1]);
+	return previous == '=' || previous == ':' || previous == ',' || previous == '"'
+		|| previous == '\'' || previous == '(' || previous == '[' || std::isspace(previous);
+}
+
+static bool is_configuration_path_prefix_end_boundary(const std::string& text, const std::size_t offset)
+{
+	if (offset >= text.size())
+		return true;
+
+	const auto next = static_cast<unsigned char>(text[offset]);
+	return next == '/' || next == '\\' || next == ',' || next == '"' || next == '\''
+		|| next == ')' || next == ']' || next == ';' || std::isspace(next);
+}
+
+static bool rewrite_legacy_configuration_path_text(std::string& text,
+	std::vector<legacy_configuration_text_rewrite_rule> rules)
+{
+	std::sort(rules.begin(), rules.end(),
+		[](const auto& lhs, const auto& rhs) {
+			return lhs.legacy_prefix.size() > rhs.legacy_prefix.size();
+		});
+
+	bool changed = false;
+	for (const auto& rule : rules)
+	{
+		std::size_t offset = 0;
+		while ((offset = text.find(rule.legacy_prefix, offset)) != std::string::npos)
+		{
+			const auto end_offset = offset + rule.legacy_prefix.size();
+			if (!is_configuration_path_prefix_start_boundary(text, offset)
+				|| !is_configuration_path_prefix_end_boundary(text, end_offset))
+			{
+				offset = end_offset;
+				continue;
+			}
+
+			text.replace(offset, rule.legacy_prefix.size(), rule.canonical_prefix);
+			offset += rule.canonical_prefix.size();
+			changed = true;
+		}
+	}
+	return changed;
+}
+
+static std::filesystem::path get_unique_configuration_migration_backup_path(
+	const std::filesystem::path& config_file)
+{
+	auto candidate = config_file;
+	candidate += ".amiberry-case-migration.bak";
+	if (!path_exists_quietly(candidate.string()))
+		return candidate;
+
+	for (int suffix = 1; suffix < 1000; ++suffix)
+	{
+		candidate = config_file;
+		candidate += ".amiberry-case-migration-" + std::to_string(suffix) + ".bak";
+		if (!path_exists_quietly(candidate.string()))
+			return candidate;
+	}
+
+	candidate = config_file;
+	candidate += ".amiberry-case-migration-last.bak";
+	return candidate;
+}
+
+static bool backup_configuration_file_for_path_migration(const std::filesystem::path& config_file)
+{
+	const auto backup_file = get_unique_configuration_migration_backup_path(config_file);
+	std::error_code ec;
+	std::filesystem::copy_file(config_file, backup_file, std::filesystem::copy_options::none, ec);
+	if (ec)
+	{
+		write_log("Configuration file path migration: failed to back up %s to %s: %s\n",
+			config_file.string().c_str(), backup_file.string().c_str(), ec.message().c_str());
+		return false;
+	}
+	return true;
+}
+
+static bool read_configuration_file_text(const std::filesystem::path& config_file, std::string& text)
+{
+	std::ifstream input(config_file, std::ios::binary);
+	if (!input)
+		return false;
+
+	std::ostringstream buffer;
+	buffer << input.rdbuf();
+	text = buffer.str();
+	return input.good() || input.eof();
+}
+
+static bool is_uae_configuration_file(const std::filesystem::path& path)
+{
+	auto extension = path.extension().string();
+	std::transform(extension.begin(), extension.end(), extension.begin(),
+		[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+	return extension == ".uae";
+}
+
+static bool migrate_legacy_configuration_file_paths(
+	const std::filesystem::path& config_file,
+	const std::vector<legacy_configuration_path_rewrite_pair>& path_pairs)
+{
+	std::string original_text;
+	if (!read_configuration_file_text(config_file, original_text))
+	{
+		write_log("Configuration file path migration: failed to read %s\n",
+			config_file.string().c_str());
+		return false;
+	}
+
+	std::vector<legacy_configuration_text_rewrite_rule> rules;
+	const auto config_file_parent = config_file.parent_path();
+	for (const auto& pair : path_pairs)
+		append_legacy_configuration_relative_text_rules(rules, pair, config_file_parent);
+
+	auto migrated_text = original_text;
+	if (!rewrite_legacy_configuration_path_text(migrated_text, rules))
+		return false;
+
+	if (!backup_configuration_file_for_path_migration(config_file))
+		return false;
+
+	if (!my_save_file_atomic(config_file.string().c_str(), migrated_text.data(), migrated_text.size()))
+	{
+		write_log("Configuration file path migration: failed to save %s\n",
+			config_file.string().c_str());
+		return false;
+	}
+
+	write_log("Configuration file path migration: rewrote legacy paths in %s\n",
+		config_file.string().c_str());
+	return true;
+}
+
+static int migrate_legacy_configuration_file_paths_in_directory(const std::string& configuration_directory,
+	const std::vector<legacy_configuration_path_rewrite_pair>& path_pairs)
+{
+	if (configuration_directory.empty() || path_pairs.empty())
+		return 0;
+	if (!my_existsdir(configuration_directory.c_str()))
+		return 0;
+
+	int migrated_files = 0;
+	std::error_code ec;
+	std::filesystem::recursive_directory_iterator iterator(configuration_directory,
+		std::filesystem::directory_options::skip_permission_denied, ec);
+	if (ec)
+	{
+		write_log("Configuration file path migration: failed to scan %s: %s\n",
+			configuration_directory.c_str(), ec.message().c_str());
+		return 0;
+	}
+
+	const std::filesystem::recursive_directory_iterator end;
+	for (; iterator != end; iterator.increment(ec))
+	{
+		if (ec)
+		{
+			write_log("Configuration file path migration: failed while reading %s: %s\n",
+				configuration_directory.c_str(), ec.message().c_str());
+			return migrated_files;
+		}
+
+		std::error_code entry_ec;
+		if (!iterator->is_regular_file(entry_ec) || entry_ec || !is_uae_configuration_file(iterator->path()))
+			continue;
+
+		if (migrate_legacy_configuration_file_paths(iterator->path(), path_pairs))
+			++migrated_files;
+	}
+
+	if (migrated_files > 0)
+	{
+		write_log("Configuration file path migration: updated %d .uae file%s\n",
+			migrated_files, migrated_files == 1 ? "" : "s");
+	}
+	return migrated_files;
+}
+
+static void migrate_legacy_configuration_file_paths()
+{
+	const auto path_pairs = build_legacy_configuration_path_rewrite_pairs(get_current_base_content_path_set());
+	migrate_legacy_configuration_file_paths_in_directory(config_path, path_pairs);
+}
+
+static bool write_selftest_text_file(const std::filesystem::path& path, const std::string& text)
+{
+	std::error_code ec;
+	std::filesystem::create_directories(path.parent_path(), ec);
+	if (ec)
+		return false;
+
+	std::ofstream output(path, std::ios::binary);
+	if (!output)
+		return false;
+	output << text;
+	return output.good();
+}
+
+static bool read_selftest_text_file(const std::filesystem::path& path, std::string& text)
+{
+	std::ifstream input(path, std::ios::binary);
+	if (!input)
+		return false;
+
+	std::ostringstream buffer;
+	buffer << input.rdbuf();
+	text = buffer.str();
+	return input.good() || input.eof();
+}
+
+static int run_path_migration_selftest_cli()
+{
+	const auto root = std::filesystem::temp_directory_path() / "amiberry-path-migration-selftest";
+	std::error_code ec;
+	std::filesystem::remove_all(root, ec);
+
+	const auto paths = get_base_content_path_set(root.string());
+	std::filesystem::create_directories(paths.config_path, ec);
+	std::filesystem::create_directories(paths.rom_path, ec);
+	std::filesystem::create_directories(paths.harddrive_path, ec);
+	std::filesystem::create_directories(paths.floppy_path, ec);
+	std::filesystem::create_directories(root / "conf", ec);
+	if (ec)
+	{
+		fprintf(stderr, "path migration selftest: failed to create fixture: %s\n", ec.message().c_str());
+		return 1;
+	}
+
+	const auto default_config = std::filesystem::path(paths.config_path) / "default.uae";
+	const auto protected_config = std::filesystem::path(paths.config_path) / "protected.uae";
+	const auto legacy_rom = (root / "roms").string();
+	const auto legacy_harddrives = (root / "harddrives").string();
+	const auto legacy_configurations = (root / "conf").string();
+
+	const std::string default_text =
+		"kickstart_rom_file=" + legacy_rom + "/kick.rom\n"
+		"uaehf0=hdf,rw,DH0:" + legacy_harddrives + "/system.hdf,0,0,0,512,0,,uae0\n"
+		"hardfile_path=../harddrives\n"
+		"comment=" + legacy_harddrives + "_backup/system.hdf\n";
+	const std::string protected_text =
+		"config_path=" + legacy_configurations + "/legacy.uae\n";
+
+	if (!write_selftest_text_file(default_config, default_text)
+		|| !write_selftest_text_file(protected_config, protected_text))
+	{
+		fprintf(stderr, "path migration selftest: failed to write fixture\n");
+		std::filesystem::remove_all(root, ec);
+		return 1;
+	}
+
+	const auto path_pairs = build_legacy_configuration_path_rewrite_pairs(paths);
+	const int migrated = migrate_legacy_configuration_file_paths_in_directory(paths.config_path, path_pairs);
+
+	std::string migrated_default;
+	std::string migrated_protected;
+	const bool read_ok = read_selftest_text_file(default_config, migrated_default)
+		&& read_selftest_text_file(protected_config, migrated_protected);
+	const auto backup_file = default_config.string() + ".amiberry-case-migration.bak";
+
+	const bool ok = read_ok
+		&& migrated == 1
+		&& migrated_default.find(paths.rom_path + "/kick.rom") != std::string::npos
+		&& migrated_default.find(paths.harddrive_path + "/system.hdf") != std::string::npos
+		&& migrated_default.find("hardfile_path=../HardDrives") != std::string::npos
+		&& migrated_default.find("harddrives_backup") != std::string::npos
+		&& migrated_default.find(legacy_rom + "/kick.rom") == std::string::npos
+		&& migrated_default.find(legacy_harddrives + "/system.hdf") == std::string::npos
+		&& migrated_protected == protected_text
+		&& std::filesystem::exists(backup_file);
+
+	if (!ok)
+	{
+		fprintf(stderr, "path migration selftest: failed\n");
+		fprintf(stderr, "migrated=%d read_ok=%d root=%s\n",
+			migrated, read_ok ? 1 : 0, root.string().c_str());
+		return 1;
+	}
+
+	std::filesystem::remove_all(root, ec);
+	printf("path migration selftest: OK\n");
+	return 0;
+}
+
 static constexpr auto LEGACY_CLEANUP_DISMISSED_KEY = _T("LegacyCleanupDismissed");
 
 static void append_legacy_cleanup_item(const std::string& label, const std::string& path, const bool is_directory)
@@ -9399,6 +10068,7 @@ int amiberry_main(int argc, char* argv[])
 	makeverstr(VersionStr);
 
 	bool run_jit_selftest = false;
+	bool run_path_migration_selftest = false;
 	bool dump_paths = false;
 	bool download_whdboot = false;
 	for (auto i = 1; i < argc; i++) {
@@ -9410,6 +10080,8 @@ int amiberry_main(int argc, char* argv[])
 			console_logging = 1;
 		if (_tcscmp(argv[i], _T("--jit-selftest")) == 0)
 			run_jit_selftest = true;
+		if (_tcscmp(argv[i], _T("--path-migration-selftest")) == 0)
+			run_path_migration_selftest = true;
 		if (_tcscmp(argv[i], _T("--dump-paths")) == 0)
 			dump_paths = true;
 		if (_tcscmp(argv[i], _T("--download-whdboot")) == 0)
@@ -9420,6 +10092,8 @@ int amiberry_main(int argc, char* argv[])
 
 	if (run_jit_selftest)
 		return run_jit_selftest_cli();
+	if (run_path_migration_selftest)
+		return run_path_migration_selftest_cli();
 
 #ifndef _WIN32
 	struct sigaction action{};
@@ -9491,6 +10165,7 @@ int amiberry_main(int argc, char* argv[])
 	migrate_legacy_configuration_directories(portable_mode);
 	migrate_legacy_visual_asset_directories();
 	migrate_legacy_lowercase_content_directories();
+	migrate_legacy_configuration_file_paths();
 	macos_bookmarks_init(settings_dir, get_legacy_bookmark_candidate_directories(portable_mode));
 	create_missing_amiberry_folders();
 	int whdboot_download_exit_code = 0;
