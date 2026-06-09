@@ -58,6 +58,7 @@
 #endif
 #ifdef JIT
 #include "jit/compemu.h"
+#include "uae/vm.h"
 #include <signal.h>
 volatile int jit_exception_pending = 0;
 #if defined(JIT_HAS_BUS_ERROR_RECOVERY)
@@ -4356,6 +4357,26 @@ static void check_uae_int_request(void)
 #endif
 				atomic_and(&uae_int_requested, ~0x010000);
 #ifdef WITH_PPC
+			} else if (!irq2 && !(intreq & 0x0008)) {
+				/*
+				 * The CyberStorm board IRQ (e.g. an NCR SCSI completion) is
+				 * still pending, but the level-2 PORTS bit it raised has been
+				 * acknowledged without the PPC having serviced the controller.
+				 * The board IRQ is level-triggered (it stays asserted in
+				 * io_reg[CSIII_REG_IRQ] until the PPC acks the NCR), yet the
+				 * PORTS bit forwarding it is edge-driven - cpuboard_rethink()
+				 * only re-raises it on a device state change. The PPC runs on
+				 * its own QEMU vCPU thread, so the first PORTS delivery can be
+				 * missed/raced; after that the pending board IRQ has no path
+				 * back to the PPC and the OS4 boot hangs until a manual
+				 * pause/resume ("the kick"). Re-present it here so OS4 gets
+				 * another chance to service the controller. Gated on the PORTS
+				 * bit being clear, so it is self-limiting (one interrupt at a
+				 * time) and stops as soon as the NCR is serviced and the board
+				 * IRQ clears.
+				 */
+				int_request_do(false);
+				irq2 = true;
 			}
 #endif
 		}
@@ -5860,6 +5881,19 @@ static void m68k_run_jit(void)
 			jit_in_compiled_code = true;
 #endif
 			for (;;) {
+#if defined(__APPLE__) && defined(CPU_AARCH64)
+				/* The qemu-uae PPC plugin generates TCG code on this (m68k)
+				 * thread during PPC init/reset (reached via do_specialties()
+				 * below) and leaves the thread in JIT *write* mode through
+				 * pthread_jit_write_protect_np(). On Apple Silicon a MAP_JIT
+				 * page is per-thread either writable or executable, so the next
+				 * dispatch into translated m68k code would fault with
+				 * EXC_BAD_ACCESS (code=2). Re-assert execute mode here so we
+				 * never run a translated block from a write-protected page.
+				 * Only needed while the PPC CPU is in use. */
+				if (currprefs.ppc_mode)
+					uae_vm_jit_write_protect(true);
+#endif
 				((compiled_handler*)(pushall_call_handler))();
 				/* Check for pending exception from SIGSEGV handler (x86-64) */
 #if defined(CPU_x86_64) || defined(_M_AMD64)

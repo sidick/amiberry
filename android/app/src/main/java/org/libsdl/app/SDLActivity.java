@@ -23,6 +23,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
+import android.os.LocaleList;
 import android.os.Message;
 import android.os.ParcelFileDescriptor;
 import android.util.DisplayMetrics;
@@ -59,8 +60,8 @@ import java.util.Locale;
 public class SDLActivity extends Activity implements View.OnSystemUiVisibilityChangeListener {
     private static final String TAG = "SDL";
     private static final int SDL_MAJOR_VERSION = 3;
-    private static final int SDL_MINOR_VERSION = 2;
-    private static final int SDL_MICRO_VERSION = 8;
+    private static final int SDL_MINOR_VERSION = 4;
+    private static final int SDL_MICRO_VERSION = 10;
 /*
     // Display InputType.SOURCE/CLASS of events and devices
     //
@@ -240,7 +241,9 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
 
     protected static SDLGenericMotionListener_API14 getMotionListener() {
         if (mMotionListener == null) {
-            if (Build.VERSION.SDK_INT >= 26 /* Android 8.0 (O) */) {
+            if (Build.VERSION.SDK_INT >= 29 /* Android 10.0 (Q) */) {
+                mMotionListener = new SDLGenericMotionListener_API29();
+            } else if (Build.VERSION.SDK_INT >= 26 /* Android 8.0 (O) */) {
                 mMotionListener = new SDLGenericMotionListener_API26();
             } else if (Build.VERSION.SDK_INT >= 24 /* Android 7.0 (N) */) {
                 mMotionListener = new SDLGenericMotionListener_API24();
@@ -1067,7 +1070,7 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
 
     // C functions we call
     public static native String nativeGetVersion();
-    public static native int nativeSetupJNI();
+    public static native void nativeSetupJNI();
     public static native void nativeInitMainThread();
     public static native void nativeCleanupMainThread();
     public static native int nativeRunMain(String library, String function, Object arguments);
@@ -1088,12 +1091,14 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native void onNativeTouch(int touchDevId, int pointerFingerId,
                                             int action, float x,
                                             float y, float p);
-    public static native void onNativePen(int penId, int button, int action, float x, float y, float p);
+    public static native void onNativePen(int penId, int device_type, int button, int action, float x, float y, float p);
     public static native void onNativeAccel(float x, float y, float z);
     public static native void onNativeClipboardChanged();
     public static native void onNativeSurfaceCreated();
     public static native void onNativeSurfaceChanged();
     public static native void onNativeSurfaceDestroyed();
+    public static native void onNativeScreenKeyboardShown();
+    public static native void onNativeScreenKeyboardHidden();
     public static native String nativeGetHint(String name);
     public static native boolean nativeGetHintBoolean(String name, boolean default_value);
     public static native void nativeSetenv(String name, String value);
@@ -1107,6 +1112,9 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     public static native boolean nativeAllowRecreateActivity();
     public static native int nativeCheckSDLThreadCounter();
     public static native void onNativeFileDialog(int requestCode, String[] filelist, int filter);
+    public static native void onNativePinchStart();
+    public static native void onNativePinchUpdate(float scale);
+    public static native void onNativePinchEnd();
 
     /**
      * This method is called by SDL using JNI.
@@ -1286,8 +1294,8 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
     /**
      * This method is called by SDL using JNI.
      */
-    public static Context getContext() {
-        return SDL.getContext();
+    public static Activity getContext() {
+        return (Activity)SDL.getContext();
     }
 
     /**
@@ -1503,11 +1511,11 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         if (SDLControllerManager.isDeviceSDLJoystick(deviceId)) {
             // Note that we process events with specific key codes here
             if (event.getAction() == KeyEvent.ACTION_DOWN) {
-                if (SDLControllerManager.onNativePadDown(deviceId, keyCode)) {
+                if (SDLControllerManager.onNativePadDown(deviceId, keyCode, event.getScanCode())) {
                     return true;
                 }
             } else if (event.getAction() == KeyEvent.ACTION_UP) {
-                if (SDLControllerManager.onNativePadUp(deviceId, keyCode)) {
+                if (SDLControllerManager.onNativePadUp(deviceId, keyCode, event.getScanCode())) {
                     return true;
                 }
             }
@@ -2126,6 +2134,55 @@ public class SDLActivity extends Activity implements View.OnSystemUiVisibilityCh
         mFileDialogState.requestCode = requestCode;
         mFileDialogState.multipleChoice = allowMultiple;
         return true;
+    }
+
+    /**
+     * This method is called by SDL using JNI.
+     */
+    public static String getPreferredLocales() {
+        String result = "";
+
+        if (Build.VERSION.SDK_INT >= 24 /* Android 7.0 (N) */) {
+            LocaleList locales = LocaleList.getAdjustedDefault();
+            for (int i = 0; i < locales.size(); ++i) {
+                if (i > 0) {
+                    result += ",";
+                }
+                result += formatLocale(locales.get(i));
+            }
+        } else if (mCurrentLocale != null) {
+            result = formatLocale(mCurrentLocale);
+        }
+        return result;
+    }
+
+    private static String formatLocale(Locale locale) {
+        String language = locale.getLanguage();
+        if (language.equals("in")) {
+            language = "id";
+        }
+        if (language.isEmpty()) {
+            language = "und";
+        }
+
+        String result = language;
+        if (Build.VERSION.SDK_INT >= 21 /* Android 5.0 (LOLLIPOP) */) {
+            String script = locale.getScript();
+            if (!script.isEmpty()) {
+                result += "-" + script;
+            }
+        }
+
+        String country = locale.getCountry();
+        if (!country.isEmpty()) {
+            result += "-" + country;
+        }
+
+        String variant = locale.getVariant();
+        if (!variant.isEmpty()) {
+            result += "-" + variant;
+        }
+        return result;
     }
 
     /* Internal class used to track active open file dialog */

@@ -1371,9 +1371,8 @@ void create_startup_sequence()
 	whd_bootscript << "FAILAT 999\n";
 
 	if (whdload_prefs.slave_libraries)
-	{
 		whd_bootscript << "DH3:C/Assign LIBS: DH3:LIBS/ ADD\n";
-	}
+
 	if (amiberry_options.use_jst_instead_of_whd)
 		whd_bootscript << "IF NOT EXISTS JST\n";
 	else
@@ -1523,6 +1522,12 @@ void set_booter_drives(uae_prefs* prefs, const char* filepath)
 
 void whdload_auto_prefs(uae_prefs* prefs, const char* filepath)
 {
+#ifdef __ANDROID__
+	const bool android_onscreen_joystick = prefs->onscreen_joystick;
+	const bool android_vkbd_enabled = prefs->vkbd_enabled;
+	const bool android_input_default_osk = prefs->input_default_onscreen_keyboard;
+#endif
+
 	config_loaded = false;
 
 	whdload_prefs.game_name.clear();
@@ -1615,10 +1620,11 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath)
 		write_log("WHDBooter - Could not load whdload_db.json or whdload_db.xml - do not exist?\n");
 	}
 
+	bool used_archive_auto_detect = false;
 	if (whdload_prefs.selected_slave.filename.empty())
 	{
 		write_log("WHDBooter - No XML match found, scanning archive for .slave files\n");
-		auto_detect_slave_from_archive(filepath, game_detail);
+		used_archive_auto_detect = auto_detect_slave_from_archive(filepath, game_detail);
 	}
 
 	build_uae_config_filename(whdload_prefs.filename);
@@ -1702,11 +1708,12 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath)
 	const auto is_mt32 = _tcsstr(filename, _T("MT32")) != nullptr || _tcsstr(filename, _T("mt32")) != nullptr;
 
 	const auto chipset_unknown = strcmpi(game_detail.chipset.c_str(), "nul") == 0;
+	const auto use_a1200_for_unknown = chipset_unknown && used_archive_auto_detect;
 
-	if (is_aga || is_cd32 || !a600_available || chipset_unknown)
+	if (is_aga || is_cd32 || !a600_available || use_a1200_for_unknown)
 	{
 		write_log("WHDBooter - Host: A1200 ROM selected%s\n",
-			chipset_unknown ? " (no XML hardware info, using A1200 as default)" : "");
+			use_a1200_for_unknown ? " (no database hardware info, using A1200 as default)" : "");
 		built_in_prefs(prefs, 4, A1200_CONFIG, 0, 0);
 		prefs->fastmem[0].size = 0x800000;
 		_tcscpy(prefs->description, _T("AutoBoot Configuration [WHDLoad] [AGA]"));
@@ -1717,6 +1724,16 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath)
 		built_in_prefs(prefs, 2, A600_CONFIG, 0, 0);
 		_tcscpy(prefs->description, _T("AutoBoot Configuration [WHDLoad]"));
 	}
+
+#ifdef __ANDROID__
+	// The Android UI can write explicit touch-control preferences before
+	// --autoload. built_in_prefs() reapplies target defaults, including the
+	// Android fallback that disables touch controls when SDL reports a joystick.
+	// Preserve the launcher's explicit choice across the WHDLoad hardware preset.
+	prefs->onscreen_joystick = android_onscreen_joystick;
+	prefs->vkbd_enabled = android_vkbd_enabled;
+	prefs->input_default_onscreen_keyboard = android_input_default_osk;
+#endif
 
 	if (is_mt32)
 	{
@@ -1745,7 +1762,7 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath)
 	//  SET THE GAME COMPATIBILITY SETTINGS
 	// BLITTER, SPRITES, MEMORY, JIT, BIG CPU ETC
 	write_log("WHDBooter - Host: setting up game compatibility settings\n");
-	set_compatibility_settings(prefs, game_detail, a600_available, is_aga || is_cd32);
+	set_compatibility_settings(prefs, game_detail, a600_available, is_aga || is_cd32 || use_a1200_for_unknown);
 
 	write_log("WHDBooter - Host: settings applied\n\n");
 }

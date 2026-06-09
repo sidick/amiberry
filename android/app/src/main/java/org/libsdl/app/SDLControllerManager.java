@@ -20,21 +20,23 @@ import android.view.View;
 public class SDLControllerManager
 {
 
-    public static native int nativeSetupJNI();
+    public static native void nativeSetupJNI();
 
     public static native void nativeAddJoystick(int device_id, String name, String desc,
                                                 int vendor_id, int product_id,
                                                 int button_mask,
-                                                int naxes, int axis_mask, int nhats, boolean can_rumble);
+                                                int naxes, int axis_mask, int nhats, boolean can_rumble,
+                                                boolean can_rumble_triggers, boolean can_set_led, boolean can_send_effect);
     public static native void nativeRemoveJoystick(int device_id);
     public static native void nativeAddHaptic(int device_id, String name);
     public static native void nativeRemoveHaptic(int device_id);
-    public static native boolean onNativePadDown(int device_id, int keycode);
-    public static native boolean onNativePadUp(int device_id, int keycode);
+    public static native boolean onNativePadDown(int device_id, int keycode, int scancode);
+    public static native boolean onNativePadUp(int device_id, int keycode, int scancode);
     public static native void onNativeJoy(int device_id, int axis,
                                           float value);
     public static native void onNativeHat(int device_id, int hat_id,
                                           int x, int y);
+    public static native void onNativeJoySensor(int device_id, int sensor_type, long sensor_timestamp, float x, float y, float z);
 
     protected static SDLJoystickHandler mJoystickHandler;
     protected static SDLHapticHandler mHapticHandler;
@@ -71,6 +73,18 @@ public class SDLControllerManager
      */
     public static void pollInputDevices() {
         mJoystickHandler.pollInputDevices();
+    }
+
+    /**
+     * This method is called by SDL using JNI.
+     */
+    public static void joystickSetLED(int device_id, int red, int green, int blue) {
+    }
+
+    /**
+     * This method is called by SDL using JNI.
+     */
+    public static void joystickSetSensorsEnabled(int device_id, boolean enabled) {
     }
 
     /**
@@ -255,7 +269,8 @@ class SDLJoystickHandler_API16 extends SDLJoystickHandler {
                     mJoysticks.add(joystick);
                     SDLControllerManager.nativeAddJoystick(joystick.device_id, joystick.name, joystick.desc,
                             getVendorId(joystickDevice), getProductId(joystickDevice),
-                            getButtonMask(joystickDevice), joystick.axes.size(), getAxisMask(joystick.axes), joystick.hats.size()/2, can_rumble);
+                            getButtonMask(joystickDevice), joystick.axes.size(), getAxisMask(joystick.axes), joystick.hats.size()/2,
+                            can_rumble, false, false, false);
                 }
             }
         }
@@ -664,6 +679,10 @@ class SDLHapticHandler {
 }
 
 class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
+    protected static final int SDL_PEN_DEVICE_TYPE_UNKNOWN = 0;
+    protected static final int SDL_PEN_DEVICE_TYPE_DIRECT = 1;
+    protected static final int SDL_PEN_DEVICE_TYPE_INDIRECT = 2;
+
     // Generic Motion (mouse hover, joystick...) events go here
     @Override
     public boolean onGenericMotion(View v, MotionEvent event) {
@@ -695,6 +714,24 @@ class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
                         consumed = true;
                         break;
 
+                    case MotionEvent.ACTION_BUTTON_PRESS:
+                        x = getEventX(event, i);
+                        y = getEventY(event, i);
+                        if (SDLSurface.beginMouseButtonTransition(event.getButtonState())) {
+                            SDLActivity.onNativeMouse(event.getButtonState(), MotionEvent.ACTION_DOWN, x, y, checkRelativeEvent(event));
+                        }
+                        consumed = true;
+                        break;
+
+                    case MotionEvent.ACTION_BUTTON_RELEASE:
+                        x = getEventX(event, i);
+                        y = getEventY(event, i);
+                        if (SDLSurface.finishMouseButtonTransition(event.getButtonState())) {
+                            SDLActivity.onNativeMouse(event.getButtonState(), MotionEvent.ACTION_UP, x, y, checkRelativeEvent(event));
+                        }
+                        consumed = true;
+                        break;
+
                     default:
                         break;
                 }
@@ -714,8 +751,11 @@ class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
 
                         // BUTTON_STYLUS_PRIMARY is 2^5, so shift by 4, and apply SDL_PEN_INPUT_DOWN/SDL_PEN_INPUT_ERASER_TIP
                         int buttons = (event.getButtonState() >> 4) | (1 << (toolType == MotionEvent.TOOL_TYPE_STYLUS ? 0 : 30));
+                        if ((event.getButtonState() & MotionEvent.BUTTON_TERTIARY) != 0) {
+                            buttons |= 0x08;
+                        }
 
-                        SDLActivity.onNativePen(event.getPointerId(i), buttons, action, x, y, p);
+                        SDLActivity.onNativePen(event.getPointerId(i), getPenDeviceType(event.getDevice()), buttons, action, x, y, p);
                         consumed = true;
                         break;
                 }
@@ -753,6 +793,9 @@ class SDLGenericMotionListener_API14 implements View.OnGenericMotionListener {
         return event.getY(pointerIndex);
     }
 
+    int getPenDeviceType(InputDevice penDevice) {
+        return SDL_PEN_DEVICE_TYPE_UNKNOWN;
+    }
 }
 
 class SDLGenericMotionListener_API24 extends SDLGenericMotionListener_API14 {
@@ -846,5 +889,17 @@ class SDLGenericMotionListener_API26 extends SDLGenericMotionListener_API24 {
     public float getEventY(MotionEvent event, int pointerIndex) {
         // Relative mouse in capture mode will only have relative for X/Y
         return event.getY(pointerIndex);
+    }
+}
+
+class SDLGenericMotionListener_API29 extends SDLGenericMotionListener_API26 {
+    @Override
+    int getPenDeviceType(InputDevice penDevice)
+    {
+        if (penDevice == null) {
+            return SDL_PEN_DEVICE_TYPE_UNKNOWN;
+        }
+
+        return penDevice.isExternal() ? SDL_PEN_DEVICE_TYPE_INDIRECT : SDL_PEN_DEVICE_TYPE_DIRECT;
     }
 }
