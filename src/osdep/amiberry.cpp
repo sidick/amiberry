@@ -89,10 +89,6 @@
 #include "ahi_v1.h"
 #include "sana2.h"
 #include "ethernet.h"
-
-#ifdef AHI_v2
-#include "ahi_v2.h"
-#endif
 #endif
 
 #ifdef USE_GPIOD
@@ -961,9 +957,6 @@ void resumesoundpaused()
 	resume_sound();
 #ifdef AHI
 	ahi_open_sound();
-#ifdef AHI_v2
-	ahi2_pause_sound(0);
-#endif
 #endif
 }
 
@@ -972,9 +965,6 @@ void setsoundpaused()
 	pause_sound();
 #ifdef AHI
 	ahi_close_sound();
-#ifdef AHI_v2
-	ahi2_pause_sound(1);
-#endif
 #endif
 }
 
@@ -5665,6 +5655,13 @@ void get_nvram_path(TCHAR* out, const int size)
 
 std::string get_plugins_path()
 {
+	const auto env_plugins_dir = getenv("AMIBERRY_PLUGINS_DIR");
+	if (env_plugins_dir != nullptr && env_plugins_dir[0] != '\0')
+	{
+		std::string path = env_plugins_dir;
+		return fix_trailing(path);
+	}
+
 	return fix_trailing(plugins_dir);
 }
 
