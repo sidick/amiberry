@@ -20,7 +20,7 @@ struct SDL_Surface;
 ImTextureID gui_create_texture(SDL_Surface* surface, int* out_w, int* out_h);
 void gui_destroy_texture(ImTextureID tex);
 
-bool BeginGroupBox(const char* name, bool collapsible = false);
+bool BeginGroupBox(const char* name, bool collapsible = false, bool default_open = true);
 void EndGroupBox(const char* name);
 
 void AmigaBevel(ImVec2 min, ImVec2 max, bool recessed);
@@ -58,6 +58,7 @@ void render_panel_io();
 void render_panel_custom();
 void render_panel_diskswapper();
 void render_panel_misc();
+void render_panel_global_settings();
 // Returns true while the Misc panel's hotkey-capture modal is open.
 // Used by the GUI main loop to suppress its own keyboard shortcuts while
 // the user is picking a key combination.

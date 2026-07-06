@@ -10,6 +10,12 @@
 #else
 #include <io.h>
 #endif
+#ifdef __ANDROID__
+#include <sched.h>
+#include <sys/syscall.h>
+#include <cerrno>
+#include <cstdint>
+#endif
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -54,6 +60,7 @@
 #include <sstream>
 
 #include "amiberry_input.h"
+#include "amiberry_adpf.h"
 #include "amiberry_update.h"
 #include "clipboard.h"
 #include "dpi_handler.hpp"
@@ -3383,20 +3390,23 @@ void update_clipboard()
 	osdep_platform_update_clipboard();
 }
 
-extern bool uae_self_is_ppc(void);
-
 int handle_msgpump(bool vblank)
 {
 	if (!osdep_platform_use_event_pump())
 		return 0;
-	/* SDL/Cocoa event pumping must never run on the qemu-uae PPC CPU thread.
-	 * That thread can reach here through a CIA register read
-	 * (uae_ppc_io_mem_read -> ReadCIAA -> handle_joystick_buttons ->
-	 * handle_msgpump); on macOS, calling the Cocoa event loop off the main
-	 * thread aborts the process ("nextEventMatchingMask should only be called
-	 * from the Main Thread!"). The host event loop is pumped by the emulation
-	 * thread every frame, so skipping it here is safe. */
-	if (uae_self_is_ppc())
+	/* SDL/Cocoa event pumping must only ever run on the main thread.
+	 * Several worker threads can reach here while the main thread is blocked
+	 * waiting on them, e.g.:
+	 *   - the qemu-uae PPC CPU thread, via a CIA register read
+	 *     (uae_ppc_io_mem_read -> ReadCIAA -> handle_joystick_buttons);
+	 *   - a bsdsocket/uaeserial extended-trap thread, which advances the
+	 *     cycle-exact chipset clock from trap_Call68k -> fill_prefetch and so
+	 *     reaches the hsync handler (inputdevice_hsync -> handle_msgpump).
+	 * On macOS, calling the Cocoa event loop off the main thread aborts the
+	 * process ("nextEventMatchingMask should only be called from the Main
+	 * Thread!"). The host event loop is pumped by the main emulation thread
+	 * every frame, so skipping it on any other thread is safe. */
+	if (!is_mainthread())
 		return 0;
 	lctrl_pressed = rctrl_pressed = lalt_pressed = ralt_pressed = lshift_pressed = rshift_pressed = lgui_pressed = rgui_pressed = false;
 	auto got_event = 0;
@@ -4409,10 +4419,152 @@ bool target_execute(const char* command)
 	return true;
 }
 
+#ifdef __ANDROID__
+// --- Android emulation-thread tuning -------------------------------------
+//
+// On big.LITTLE Android devices two scheduler behaviours hurt emulation a few
+// seconds into a game, once the initial CPU boost settles:
+//   1. the scheduler migrates the thread onto an efficiency ("little") core, and
+//   2. a power-saving CPU profile keeps the core frequency low.
+// Either way the same workload suddenly runs much slower: host CPU usage
+// climbs, the emulation can no longer keep up with the Amiga refresh and audio
+// underruns.  We counter (1) by pinning the thread to the performance cluster
+// and (2) by raising its uclamp frequency floor.  Both only affect the calling
+// thread, so they must run on the emulation thread (target_run() does).
+
+// uclamp / sched_setattr are not wrapped by bionic, so declare the minimal bits
+// we need.  The layout matches the kernel's struct sched_attr (uclamp version).
+struct amiberry_sched_attr {
+	uint32_t size;
+	uint32_t sched_policy;
+	uint64_t sched_flags;
+	int32_t  sched_nice;
+	uint32_t sched_priority;
+	uint64_t sched_runtime;
+	uint64_t sched_deadline;
+	uint64_t sched_period;
+	uint32_t sched_util_min;
+	uint32_t sched_util_max;
+};
+#ifndef SCHED_FLAG_KEEP_POLICY
+#define SCHED_FLAG_KEEP_POLICY 0x08
+#endif
+#ifndef SCHED_FLAG_KEEP_PARAMS
+#define SCHED_FLAG_KEEP_PARAMS 0x10
+#endif
+#ifndef SCHED_FLAG_UTIL_CLAMP_MIN
+#define SCHED_FLAG_UTIL_CLAMP_MIN 0x20
+#endif
+
+// Pin the calling (emulation) thread to the performance ("big") cluster.
+// Note: threads created afterwards inherit this affinity mask.  That is
+// acceptable here - the threads spawned later (audio, display, device I/O) are
+// all emulation work that also benefits from the fast cores, and the multi-core
+// big clusters this targets have ample headroom.
+static void pin_emulation_thread_to_big_cores()
+{
+	const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+	if (ncpu <= 1 || ncpu > CPU_SETSIZE)
+		return;
+
+	// Read each core's hardware max frequency; big cores clock higher than
+	// little ones.  cpuinfo_max_freq is the fixed silicon ceiling, so unlike
+	// scaling_max_freq it is unaffected by the governor's current power profile.
+	// An offline core has no cpufreq node and stays marked unknown (-1), so we
+	// never pin to a core we could not classify.
+	std::vector<long> max_freq(static_cast<size_t>(ncpu), -1);
+	long highest = 0;
+	int read_count = 0;
+	for (long i = 0; i < ncpu; i++) {
+		char path[128];
+		snprintf(path, sizeof path,
+			"/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", i);
+		FILE* f = fopen(path, "r");
+		if (f) {
+			long v = 0;
+			if (fscanf(f, "%ld", &v) == 1) {
+				max_freq[i] = v;
+				read_count++;
+				if (v > highest)
+					highest = v;
+			}
+			fclose(f);
+		}
+	}
+	// Could not classify any core: leave scheduling untouched.
+	if (read_count == 0 || highest == 0)
+		return;
+
+	// Treat every core within 25% of the fastest readable core as a performance
+	// core.  This keeps the whole big cluster on multi-tier SoCs (e.g. the 1
+	// prime + 3 big A77 cores of a Snapdragon 865) while excluding the A55
+	// efficiency cores, which clock well below that threshold.
+	const long threshold = highest * 3 / 4;
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	int perf_cores = 0;
+	for (long i = 0; i < ncpu; i++) {
+		if (max_freq[i] >= threshold) {
+			CPU_SET(static_cast<int>(i), &set);
+			perf_cores++;
+		}
+	}
+	// Every core we could read is the same speed (no distinct big cluster).
+	// Comparing against read_count - not ncpu - also prevents pinning to little
+	// cores in the unlikely case that every big core was offline during
+	// detection: those little cores would then all match and we bail out here.
+	if (perf_cores == 0 || perf_cores == read_count)
+		return;
+
+	if (sched_setaffinity(0, sizeof set, &set) == 0)
+		write_log("Pinned emulation thread to %d performance core(s) of %ld\n", perf_cores, ncpu);
+	else
+		write_log("Failed to set emulation thread CPU affinity: %s\n", strerror(errno));
+}
+
+// Raise the calling (emulation) thread's uclamp frequency floor so the cpufreq
+// governor clocks its core up even under a power-saving profile - mirroring the
+// device's "High performance" mode, but scoped to this thread.  Requires a
+// kernel with uclamp support (5.3+); on older kernels the syscall fails and we
+// simply continue without the boost.
+static void boost_emulation_thread_frequency()
+{
+	amiberry_sched_attr attr = {};
+	attr.size = sizeof attr;
+	attr.sched_flags = SCHED_FLAG_KEEP_POLICY | SCHED_FLAG_KEEP_PARAMS | SCHED_FLAG_UTIL_CLAMP_MIN;
+	attr.sched_util_min = 1024; // 0-1024; request maximum utilisation -> highest frequency
+	if (syscall(__NR_sched_setattr, 0, &attr, 0u) == 0)
+		write_log("Boosted emulation thread frequency (uclamp util_min=1024)\n");
+	else
+		write_log("uclamp frequency boost unavailable: %s\n", strerror(errno));
+}
+
+// Tune the CALLING thread for sustained emulation performance.  Called on the
+// main thread from target_run(); also called on the dedicated CPU thread (when
+// cpu_threaded is enabled) so the thread actually executing the m68k core is
+// covered - target_run() runs before that thread exists, so it cannot tune it.
+// On API 31+ the OS adaptively manages CPU frequency and core placement through
+// the ADPF hint session.  When ADPF is unavailable for this thread (older API,
+// the hint API could not be resolved or the device has no hint backend) or it
+// is disabled via use_adpf, fall back to statically pinning the thread to the
+// big cores and raising its uclamp frequency floor.
+void amiberry_tune_emulation_thread()
+{
+	const bool adpf_active = amiberry_options.use_adpf && adpf_register_thread(gettid());
+	if (!adpf_active) {
+		pin_emulation_thread_to_big_cores();
+		boost_emulation_thread_frequency();
+	}
+}
+#endif
+
 void target_run()
 {
 	// Reset counter for access violations
 	init_max_signals();
+#ifdef __ANDROID__
+	amiberry_tune_emulation_thread();
+#endif
 }
 
 void target_quit()
@@ -4420,6 +4572,7 @@ void target_quit()
 	cancel_async_update_check();
 
 #ifdef __ANDROID__
+	adpf_cleanup();
 	// Write a clean-exit marker so the Kotlin launcher knows this was
 	// an intentional quit, not a crash.  SDL3's SDLActivity calls
 	// System.exit(0) after native main() returns, which kills the
@@ -4779,7 +4932,7 @@ void target_default_options(uae_prefs* p, const int type)
 	// On-screen joystick
 	p->onscreen_joystick = amiberry_options.default_onscreen_joystick;
 
-	// Virtual keyboard default options
+	// On-screen keyboard default options
 	p->vkbd_enabled = amiberry_options.default_vkbd_enabled;
 
 #ifdef __ANDROID__
@@ -4792,16 +4945,10 @@ void target_default_options(uae_prefs* p, const int type)
 		p->vkbd_enabled = false;
 	}
 #endif
-	p->vkbd_exit = amiberry_options.default_vkbd_exit;
-	p->vkbd_hires = amiberry_options.default_vkbd_hires;
 	if (amiberry_options.default_vkbd_language[0])
 		_tcscpy(p->vkbd_language, amiberry_options.default_vkbd_language);
 	else
 		_tcscpy(p->vkbd_language, ""); // This will use the default language.
-	if (amiberry_options.default_vkbd_style[0])
-		_tcscpy(p->vkbd_style, amiberry_options.default_vkbd_style);
-	else
-		_tcscpy(p->vkbd_style, ""); // This will use the default theme.
 	p->vkbd_transparency = amiberry_options.default_vkbd_transparency;
 	_tcscpy(p->vkbd_toggle, amiberry_options.default_vkbd_toggle);
 
@@ -4969,11 +5116,8 @@ void target_save_options(zfile* f, uae_prefs* p)
 
 	cfgfile_target_dwrite_bool(f, _T("onscreen_joystick"), p->onscreen_joystick);
 	cfgfile_target_dwrite_bool(f, _T("vkbd_enabled"), p->vkbd_enabled);
-	cfgfile_target_dwrite_bool(f, _T("vkbd_hires"), p->vkbd_hires);
-	cfgfile_target_dwrite_bool(f, _T("vkbd_exit"), p->vkbd_exit);
 	cfgfile_target_dwrite(f, _T("vkbd_transparency"), "%d", p->vkbd_transparency);
 	cfgfile_target_dwrite_str(f, _T("vkbd_language"), p->vkbd_language);
-	cfgfile_target_dwrite_str(f, _T("vkbd_style"), p->vkbd_style);
 	cfgfile_target_dwrite_str(f, _T("vkbd_toggle"), p->vkbd_toggle);
 }
 
@@ -5629,9 +5773,31 @@ void set_rom_path(const std::string& newpath)
 	macos_bookmark_store(newpath);
 }
 
+std::string get_rp9_path()
+{
+	return fix_trailing(rp9_path);
+}
+
 void get_rp9_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(rp9_path).c_str(), size - 1);
+}
+
+void set_rp9_path(const std::string& newpath)
+{
+	rp9_path = newpath;
+	macos_bookmark_store(newpath);
+}
+
+std::string get_saveimage_path()
+{
+	return fix_trailing(saveimage_dir);
+}
+
+void set_saveimage_path(const std::string& newpath)
+{
+	saveimage_dir = newpath;
+	macos_bookmark_store(newpath);
 }
 
 void get_savestate_path(char* out, const int size)
@@ -5643,9 +5809,32 @@ void get_savestate_path(char* out, const int size)
 	_tcsncpy(out, fix_trailing(savestate_dir).c_str(), size - 1);
 }
 
+std::string get_savestate_path()
+{
+	if (path_statefile[0])
+		return path_statefile;
+	return fix_trailing(savestate_dir);
+}
+
+std::string get_ripper_path()
+{
+	return fix_trailing(ripper_path);
+}
+
 void fetch_ripperpath(TCHAR* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(ripper_path).c_str(), size - 1);
+}
+
+void set_ripper_path(const std::string& newpath)
+{
+	ripper_path = newpath;
+	macos_bookmark_store(newpath);
+}
+
+std::string get_inputrecordings_path()
+{
+	return fix_trailing(input_dir);
 }
 
 void fetch_inputfilepath(TCHAR* out, const int size)
@@ -5653,9 +5842,20 @@ void fetch_inputfilepath(TCHAR* out, const int size)
 	_tcsncpy(out, fix_trailing(input_dir).c_str(), size - 1);
 }
 
+void set_inputrecordings_path(const std::string& newpath)
+{
+	input_dir = newpath;
+	macos_bookmark_store(newpath);
+}
+
 void get_nvram_path(TCHAR* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(nvram_dir).c_str(), size - 1);
+}
+
+std::string get_nvram_path()
+{
+	return fix_trailing(nvram_dir);
 }
 
 std::string get_plugins_path()
@@ -5685,6 +5885,11 @@ void get_video_path(char* out, const int size)
 	_tcsncpy(out, fix_trailing(video_dir).c_str(), size - 1);
 }
 
+std::string get_video_path()
+{
+	return fix_trailing(video_dir);
+}
+
 std::string get_themes_path()
 {
 	return fix_trailing(themes_path);
@@ -5703,6 +5908,17 @@ std::string get_bezels_path()
 void get_floppy_sounds_path(char* out, const int size)
 {
 	_tcsncpy(out, fix_trailing(floppy_sounds_dir).c_str(), size - 1);
+}
+
+std::string get_floppy_sounds_path()
+{
+	return fix_trailing(floppy_sounds_dir);
+}
+
+void set_floppy_sounds_path(const std::string& newpath)
+{
+	floppy_sounds_dir = newpath;
+	macos_bookmark_store(newpath);
 }
 
 int target_cfgfile_load(uae_prefs* p, const char* filename, int type, const int isdefault)
@@ -5881,12 +6097,12 @@ void read_directory(const std::string& path, std::vector<std::string>* dirs, std
 		sort(files->begin(), files->end());
 }
 
-void save_amiberry_settings()
+bool save_amiberry_settings_with_result()
 {
 	ensure_parent_directory_exists(amiberry_conf_file);
 	auto* const f = uae_fopen(amiberry_conf_file.c_str(), "we");
 	if (!f)
-		return;
+		return false;
 
 	char buffer[MAX_DPATH];
 
@@ -5969,6 +6185,7 @@ void save_amiberry_settings()
 	write_bool_option("default_frameskip", amiberry_options.default_frameskip);
 	write_bool_option("perf_log", amiberry_options.perf_log);
 	write_bool_option("slow_host_warning", amiberry_options.slow_host_warning);
+	write_bool_option("use_adpf", amiberry_options.use_adpf);
 	write_bool_option("default_disable_cycle_exact", amiberry_options.default_disable_cycle_exact);
 	write_int_option("default_quickstart_compatibility", amiberry_options.default_quickstart_compatibility);
 
@@ -6062,22 +6279,13 @@ void save_amiberry_settings()
 	// Enable Virtual Keyboard by default
 	write_bool_option("default_vkbd_enabled", amiberry_options.default_vkbd_enabled);
 
-	// Show the High-res version of the Virtual Keyboard by default
-	write_bool_option("default_vkbd_hires", amiberry_options.default_vkbd_hires);
-
-	// Enable Quit functionality through Virtual Keyboard by default
-	write_bool_option("default_vkbd_exit", amiberry_options.default_vkbd_exit);
-
-	// Default Language for the Virtual Keyboard
+	// Default layout for the On-screen Keyboard
 	write_string_option("default_vkbd_language", amiberry_options.default_vkbd_language);
 
-	// Default Style for the Virtual Keyboard
-	write_string_option("default_vkbd_style", amiberry_options.default_vkbd_style);
-
-	// Default transparency for the Virtual Keyboard
+	// Default transparency for the On-screen Keyboard
 	write_int_option("default_vkbd_transparency", amiberry_options.default_vkbd_transparency);
 
-	// Default controller button for toggling the Virtual Keyboard
+	// Default controller button for toggling the On-screen Keyboard
 	write_string_option("default_vkbd_toggle", amiberry_options.default_vkbd_toggle);
 
 	// GUI Theme
@@ -6159,7 +6367,14 @@ void save_amiberry_settings()
 		write_string_option("WHDLoadfile", i);
 	}
 	
-	fclose(f);
+	const bool write_ok = ferror(f) == 0;
+	const bool close_ok = fclose(f) == 0;
+	return write_ok && close_ok;
+}
+
+void save_amiberry_settings()
+{
+	(void)save_amiberry_settings_with_result();
 }
 
 void get_string(FILE* f, char* dst, const int size)
@@ -6365,6 +6580,7 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_yesno(option, value, "default_frameskip", &amiberry_options.default_frameskip);
 		ret |= cfgfile_yesno(option, value, "perf_log", &amiberry_options.perf_log);
 		ret |= cfgfile_yesno(option, value, "slow_host_warning", &amiberry_options.slow_host_warning);
+		ret |= cfgfile_yesno(option, value, "use_adpf", &amiberry_options.use_adpf);
 		ret |= cfgfile_yesno(option, value, "default_disable_cycle_exact", &amiberry_options.default_disable_cycle_exact);
 		ret |= cfgfile_intval(option, value, "default_quickstart_compatibility", &amiberry_options.default_quickstart_compatibility, 1);
 		ret |= cfgfile_yesno(option, value, "default_correct_aspect_ratio", &amiberry_options.default_correct_aspect_ratio);
@@ -6398,12 +6614,15 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_intval(option, value, "default_soundcard", &amiberry_options.default_soundcard, 1);
 		ret |= cfgfile_yesno(option, value, "default_onscreen_joystick", &amiberry_options.default_onscreen_joystick);
 		ret |= cfgfile_yesno(option, value, "default_vkbd_enabled", &amiberry_options.default_vkbd_enabled);
-		ret |= cfgfile_yesno(option, value, "default_vkbd_hires", &amiberry_options.default_vkbd_hires);
-		ret |= cfgfile_yesno(option, value, "default_vkbd_exit", &amiberry_options.default_vkbd_exit);
 		ret |= cfgfile_string(option, value, "default_vkbd_language", amiberry_options.default_vkbd_language, sizeof amiberry_options.default_vkbd_language);
-		ret |= cfgfile_string(option, value, "default_vkbd_style", amiberry_options.default_vkbd_style, sizeof amiberry_options.default_vkbd_style);
 		ret |= cfgfile_intval(option, value, "default_vkbd_transparency", &amiberry_options.default_vkbd_transparency, 1);
 		ret |= cfgfile_string(option, value, "default_vkbd_toggle", amiberry_options.default_vkbd_toggle, sizeof amiberry_options.default_vkbd_toggle);
+		// Legacy bitmap vkbd defaults. Accept old amiberry.conf files, but do not apply or re-save these.
+		bool legacy_vkbd_bool;
+		char legacy_vkbd_string[128];
+		ret |= cfgfile_yesno(option, value, "default_vkbd_hires", &legacy_vkbd_bool);
+		ret |= cfgfile_yesno(option, value, "default_vkbd_exit", &legacy_vkbd_bool);
+		ret |= cfgfile_string(option, value, "default_vkbd_style", legacy_vkbd_string, sizeof legacy_vkbd_string);
 		ret |= cfgfile_string(option, value, "gui_theme", amiberry_options.gui_theme, sizeof amiberry_options.gui_theme);
 		ret |= cfgfile_string(option, value, "shader", amiberry_options.shader, sizeof amiberry_options.shader);
 		ret |= cfgfile_string(option, value, "shader_rtg", amiberry_options.shader_rtg, sizeof amiberry_options.shader_rtg);

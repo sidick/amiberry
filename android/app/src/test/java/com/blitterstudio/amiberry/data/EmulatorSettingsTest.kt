@@ -3,6 +3,7 @@ package com.blitterstudio.amiberry.data
 import com.blitterstudio.amiberry.data.model.AmigaModel
 import com.blitterstudio.amiberry.data.model.EmulatorSettings
 import com.blitterstudio.amiberry.data.model.EmulatorSettingsConstraints
+import com.blitterstudio.amiberry.data.model.HardDrive
 import org.junit.Assert.*
 import org.junit.Test
 
@@ -230,7 +231,7 @@ class EmulatorSettingsTest {
 	fun `constraints clear JIT FPU when 24-bit addressing disables JIT`() {
 		val constrained = EmulatorSettingsConstraints.apply(
 			EmulatorSettings(
-				cpuModel = 68040,
+				cpuModel = 68020,
 				address24Bit = true,
 				cpuCompatible = true,
 				jitCacheSize = 8192,
@@ -242,6 +243,32 @@ class EmulatorSettingsTest {
 		assertEquals(0, constrained.jitCacheSize)
 		assertFalse(constrained.jitFpu)
 		assertTrue(constrained.cpuCompatible)
+	}
+
+	@Test
+	fun `constraints clear 24-bit addressing when switching from 68020 to 68030`() {
+		val constrained = EmulatorSettingsConstraints.apply(
+			EmulatorSettings(
+				cpuModel = 68030,
+				address24Bit = true
+			),
+			hasTouchScreen = true
+		)
+
+		assertFalse(constrained.address24Bit)
+	}
+
+	@Test
+	fun `constraints keep 24-bit addressing editable for 68020`() {
+		val constrained = EmulatorSettingsConstraints.apply(
+			EmulatorSettings(
+				cpuModel = 68020,
+				address24Bit = true
+			),
+			hasTouchScreen = true
+		)
+
+		assertTrue(constrained.address24Bit)
 	}
 
 	@Test
@@ -316,6 +343,39 @@ class EmulatorSettingsTest {
 		assertEquals("exact", constrained.soundOutput)
 		assertEquals(44100, constrained.soundFreq)
 		assertEquals("stereo", constrained.soundChannels)
+	}
+
+	// --- Hard drives ---
+
+	@Test
+	fun `default settings have no hard drives`() {
+		assertTrue(EmulatorSettings().hardDrives.isEmpty())
+	}
+
+	// --- Integer scaling defaults ---
+
+	@Test
+	fun `default settings have integer scaling off`() {
+		val s = EmulatorSettings()
+		assertEquals(-1, s.scalingMethod)
+		assertEquals(0, s.gfxAutoresolution)
+	}
+
+	@Test
+	fun `constraints keep integer scaling and autoresolution in sync`() {
+		val methodOnly = EmulatorSettingsConstraints.apply(
+			EmulatorSettings(scalingMethod = 2, gfxAutoresolution = 0),
+			hasTouchScreen = true
+		)
+		val autoresolutionOnly = EmulatorSettingsConstraints.apply(
+			EmulatorSettings(scalingMethod = -1, gfxAutoresolution = 1),
+			hasTouchScreen = true
+		)
+
+		assertEquals(2, methodOnly.scalingMethod)
+		assertEquals(1, methodOnly.gfxAutoresolution)
+		assertEquals(2, autoresolutionOnly.scalingMethod)
+		assertEquals(1, autoresolutionOnly.gfxAutoresolution)
 	}
 
 	@Test

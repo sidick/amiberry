@@ -6,6 +6,7 @@ set(SOURCE_FILES
         src/amax.cpp
         src/ar.cpp
         src/arcadia.cpp
+		src/atonce.cpp
         src/audio.cpp
         src/autoconf.cpp
         src/blitfunc.cpp
@@ -219,6 +220,7 @@ set(SOURCE_FILES
         src/osdep/host_detect.cpp
         src/osdep/midi.cpp
         src/osdep/perf_monitor.cpp
+        src/osdep/amiberry_adpf.cpp
         src/osdep/mhi_host.cpp
         src/osdep/mp3decoder.cpp
         src/osdep/picasso96.cpp
@@ -347,6 +349,7 @@ set(IMGUI_GUI_FILES
 		src/osdep/imgui/filter.cpp
 		src/osdep/imgui/expansions.cpp
 		src/osdep/imgui/floppy.cpp
+		src/osdep/imgui/global_settings.cpp
 		src/osdep/imgui/hd.cpp
 		src/osdep/imgui/hwinfo.cpp
 		src/osdep/imgui/input.cpp

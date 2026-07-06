@@ -6,6 +6,7 @@
 #include "threaddep/thread.h"
 #include "machdep/rpt.h"
 #include "memory.h"
+#include "newcpu.h"
 #include "cpuboard.h"
 #include "debug.h"
 #include "custom.h"
@@ -41,6 +42,9 @@ static volatile int spinlock_cnt;
 #endif
 
 static volatile bool ppc_spinlock_waiting;
+static volatile bool qemu_ppc_jit_flush_pending;
+static constexpr int QEMU_QUICK_HANDOFF_IDLE_MAX = 10;
+static int qemu_ppc_quick_handoff_count;
 
 #ifdef WIN32_SPINLOCK
 #define CRITICAL_SECTION_SPIN_COUNT 5000
@@ -203,6 +207,7 @@ typedef void (PPCCALL *ppc_cpu_pause_function)(int pause);
 typedef bool (PPCCALL *ppc_cpu_check_state_function)(int state);
 typedef void (PPCCALL *ppc_cpu_set_state_function)(int state);
 typedef void (PPCCALL *ppc_cpu_reset_function)(void);
+typedef void (PPCCALL *ppc_cpu_flush_jit_function)(void);
 
 /* Function pointers to active PPC implementation */
 
@@ -228,6 +233,7 @@ static struct impl {
 	ppc_cpu_check_state_function check_state;
 	ppc_cpu_set_state_function set_state;
 	ppc_cpu_reset_function reset;
+	ppc_cpu_flush_jit_function flush_jit;
 	qemu_uae_ppc_in_cpu_thread_function in_cpu_thread;
 	qemu_uae_ppc_external_interrupt_function external_interrupt;
 	qemu_uae_lock_function lock;
@@ -309,6 +315,10 @@ static bool load_qemu_implementation(void)
 	}
 	//impl.free = (ppc_cpu_free_function) uae_dlsym(handle, "ppc_cpu_free");
 	//impl.stop = (ppc_cpu_stop_function) uae_dlsym(handle, "ppc_cpu_stop");
+	impl.flush_jit = (ppc_cpu_flush_jit_function) uae_dlsym(handle, "ppc_cpu_flush_jit");
+	if (impl.flush_jit) {
+		write_log(_T("PPC: Imported optional ppc_cpu_flush_jit\n"));
+	}
 
 	// FIXME: not needed, handled internally by uae_dlopen_plugin
 	// uae_dlopen_patch_common(handle);
@@ -369,6 +379,49 @@ static bool using_qemu(void)
 static bool using_pearpc(void)
 {
 	return ppc_implementation == PPC_IMPLEMENTATION_PEARPC;
+}
+
+static int qemu_ppc_quick_handoff_sleep_ms(void)
+{
+	if (!using_qemu()) {
+		qemu_ppc_quick_handoff_count = 0;
+		return 1;
+	}
+
+	const int idle = currprefs.ppc_cpu_idle;
+	if (idle <= 0) {
+		qemu_ppc_quick_handoff_count = 0;
+		return 0;
+	}
+	if (idle >= QEMU_QUICK_HANDOFF_IDLE_MAX) {
+		qemu_ppc_quick_handoff_count = 0;
+		return 1;
+	}
+
+	const int sleep_interval = QEMU_QUICK_HANDOFF_IDLE_MAX + 1 - idle;
+	if (++qemu_ppc_quick_handoff_count >= sleep_interval) {
+		qemu_ppc_quick_handoff_count = 0;
+		return 1;
+	}
+	return 0;
+}
+
+void uae_ppc_mark_code_cache_dirty(void)
+{
+	qemu_ppc_jit_flush_pending = true;
+}
+
+/* QEMU PPC can execute direct-mapped shared RAM that the m68k patched outside
+ * QEMU's softmmu. Use m68k cache flushes as the dirty signal and consume one
+ * JIT/TLB flush at the next m68k->PPC handoff (#2114), instead of flushing on
+ * every scheduler poll. */
+static void request_qemu_ppc_jit_flush(void)
+{
+	if (!qemu_ppc_jit_flush_pending || !using_qemu() || !impl.flush_jit || regs.halted) {
+		return;
+	}
+	qemu_ppc_jit_flush_pending = false;
+	impl.flush_jit();
 }
 
 enum PPCLockMethod {
@@ -664,6 +717,7 @@ static void uae_ppc_cpu_reset(void)
 
 	if (using_qemu()) {
 		impl.reset();
+		qemu_ppc_jit_flush_pending = true;
 	} else if (using_pearpc()) {
 		write_log(_T("PPC: Init\n"));
 		impl.set_pc(0, 0xfff00100);
@@ -693,6 +747,7 @@ static int ppc_thread(void *v)
 void uae_ppc_execute_check(void)
 {
 	if (ppc_spinlock_waiting) {
+		request_qemu_ppc_jit_flush();
 		uae_ppc_spinlock_release();
 		uae_ppc_spinlock_get();
 	}
@@ -700,8 +755,9 @@ void uae_ppc_execute_check(void)
 
 void uae_ppc_execute_quick()
 {
+	request_qemu_ppc_jit_flush();
 	uae_ppc_spinlock_release();
-	sleep_millis_main(1);
+	sleep_millis_main(qemu_ppc_quick_handoff_sleep_ms());
 	uae_ppc_spinlock_get();
 }
 

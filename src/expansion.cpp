@@ -60,6 +60,7 @@
 #endif
 #ifdef WITH_X86
 #include "x86.h"
+#include "atonce.h"
 #endif
 #include "filesys.h"
 #include "ethernet.h"
@@ -3258,8 +3259,13 @@ static void expansion_parse_cards(struct uae_prefs *p, bool log)
 			} else {
 				cd->base = aci->start;
 				cd->size = aci->size;
-				if (log)
-					write_log(_T("'%s' no autoconfig %08x - %08x.\n"), aci->label ? aci->label : _T("<no name>"), cd->base, cd->base + cd->size - 1);
+				if (log) {
+					const TCHAR *board_label = aci->label ? aci->label : _T("<no name>");
+					if (cd->base == 0xffffffff || cd->size == 0)
+						write_log(_T("'%s' no autoconfig (unassigned).\n"), board_label);
+					else
+						write_log(_T("'%s' no autoconfig %08x - %08x.\n"), board_label, cd->base, cd->base + cd->size - 1);
+				}
 			}
 			_tcscpy(aci->name, label);
 			if (cd->flags & CARD_FLAG_CHILD)
@@ -4582,6 +4588,23 @@ static const struct expansionboardsettings x86vga_settings[] = {
 		_T("Chipset\0") _T("CL-GD5426\0") _T("CL-GD5429\0"),
 		_T("chipset\0") _T("cl-gd5426\0") _T("cl-gd5429\0"),
 		true
+	},
+	{
+		NULL
+	}
+};
+
+static const struct expansionboardsettings atonce_bridge_settings[] = {
+	{
+		// 0
+		_T("Automount first MBR hardfile"),
+		_T("automounthdf"),
+	},
+	{
+		// 19 (not yet implemented)
+		_T("FPU"),
+		_T("fpu"),
+		false, false, 19
 	},
 	{
 		NULL
@@ -6204,6 +6227,17 @@ const struct expansionromtype expansionroms[] = {
 		false, EXPANSIONTYPE_X86_BRIDGE,
 		0, 0, 0, false, NULL,
 		false, 0, x86at386_bridge_settings
+	},
+	{
+		// Vortex ATonce Plus: 286 board in the A500 68000 socket. Not a Zorro
+		// bridgeboard: no autoconfig, no BIOS ROM file (the x86 BIOS is loaded
+		// from the floppy .dsg into Amiga chip RAM by the 68k driver).
+		_T("atonceplus"), _T("ATonce Plus"), _T("Vortex"),
+		NULL, atonce_init, NULL, NULL, ROMTYPE_ATONCE | ROMTYPE_NONE, 0, 0, BOARD_NONAUTOCONFIG_BEFORE, true,
+		NULL, 0,
+		false, EXPANSIONTYPE_X86_BRIDGE,
+		0, 0, 0, false, NULL,
+		false, 0, atonce_bridge_settings
 	},
 #endif
 

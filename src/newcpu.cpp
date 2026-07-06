@@ -1781,6 +1781,11 @@ void flush_cpu_caches_040(uae_u16 opcode)
 	bool pushinv = (regs.cacr & 0x01000000) == 0; // 68060 DPI
 
 	flush_cpu_caches_040_2(cache, scope, addr, push, pushinv);
+#ifdef WITH_PPC
+	if (cache & 2) {
+		uae_ppc_mark_code_cache_dirty();
+	}
+#endif
 	mmu_flush_cache();
 }
 
@@ -5791,6 +5796,11 @@ typedef void compiled_handler (void);
 static int cpu_thread_run_jit(void *v)
 {
 	cpu_thread_tid = uae_thread_get_id(nullptr);
+#ifdef __ANDROID__
+	// This thread runs the m68k core in cpu_threaded mode; target_run() tuned
+	// the main thread before this thread existed, so tune ourselves here too.
+	amiberry_tune_emulation_thread();
+#endif
 	__atomic_store_n(&cpu_thread_indirect_mode, 0xff, __ATOMIC_RELEASE);
 	__atomic_store_n(&cpu_thread_reset, 0, __ATOMIC_RELEASE);
 	cpu_thread_active = 1;
@@ -6756,6 +6766,11 @@ static int cpu_thread_run_2(void *v)
 	struct regstruct *r = &regs;
 
 	cpu_thread_tid = uae_thread_get_id(nullptr);
+#ifdef __ANDROID__
+	// This thread runs the m68k core in cpu_threaded mode; target_run() tuned
+	// the main thread before this thread existed, so tune ourselves here too.
+	amiberry_tune_emulation_thread();
+#endif
 	__atomic_store_n(&cpu_thread_indirect_mode, 0xff, __ATOMIC_RELEASE);
 	__atomic_store_n(&cpu_thread_reset, 0, __ATOMIC_RELEASE);
 

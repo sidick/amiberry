@@ -86,13 +86,15 @@ if(ANDROID)
     # Android: build third-party deps from source via FetchContent (pinned tags)
     # -------------------------------------------------------------------------
     # Note: Desktop builds use system packages (see non-ANDROID branch below).
-    set(FETCHCONTENT_UPDATES_DISCONNECTED ON)
+    # Android release builds must not reuse stale FetchContent checkouts when
+    # a pinned dependency tag changes; SDL's Java/JNI shims must stay in lockstep.
+    set(FETCHCONTENT_UPDATES_DISCONNECTED OFF)
 
     # SDL3 / SDL3_image (built from source on Android)
     FetchContent_Declare(
         sdl3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG        release-3.4.10
+        GIT_TAG        release-3.4.12
     )
     FetchContent_Declare(
         sdl3_image
@@ -616,6 +618,15 @@ if(NOT IOS)
     add_subdirectory(external/floppybridge)
 endif()
 add_subdirectory(external/capsimage)
+# Keep the plugin filenames Amiberry's loader expects (libCAPSImg.dll on
+# Windows, libcapsimage.so/.dylib elsewhere), without version suffixes.
+if(WIN32)
+    set_target_properties(CAPSImage PROPERTIES OUTPUT_NAME CAPSImg PREFIX "lib")
+else()
+    set_target_properties(CAPSImage PROPERTIES OUTPUT_NAME capsimage)
+endif()
+set_property(TARGET CAPSImage PROPERTY VERSION)
+set_property(TARGET CAPSImage PROPERTY SOVERSION)
 
 # Prefer imported targets from CONFIG mode (vcpkg), fall back to MODULE variables.
 # On Android, SDL3_image is already linked via the FetchContent target.
@@ -757,9 +768,9 @@ endif()
 # capsimage and floppybridge are plugins (not linked into amiberry) but are
 # copied by post-build commands. Explicit dependencies ensure they are built.
 if(IOS)
-    add_dependencies(${PROJECT_NAME} capsimage)
+    add_dependencies(${PROJECT_NAME} CAPSImage)
 else()
-    add_dependencies(${PROJECT_NAME} floppybridge capsimage)
+    add_dependencies(${PROJECT_NAME} floppybridge CAPSImage)
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

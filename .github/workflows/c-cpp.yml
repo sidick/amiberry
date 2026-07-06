@@ -31,7 +31,7 @@ permissions:
 
 env:
   QEMU_UAE_RELEASE_REPO: BlitterStudio/amiberry-qemu-uae
-  QEMU_UAE_RELEASE_TAG: v11.0.1-amiberry.6
+  QEMU_UAE_RELEASE_TAG: v11.0.1-amiberry.7
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -75,14 +75,30 @@ jobs:
             (readlink $f | grep -q -s "/Library") && echo Removing "$f" && rm -f "$f"; \
           done || exit 0
 
-      - name: Pre-install gobject-introspection from source
+      - name: Ensure GLib is available for QEMU-UAE plugin bundling
         if: matrix.arch == 'intel'
-        run: brew install --build-from-source gobject-introspection
+        run: |
+          # Intel runners normally include GLib already. Avoid upgrading it via
+          # the old gobject-introspection workaround, since Homebrew postinstall
+          # failures there can fail CI even when the libraries are usable.
+          if ! brew --prefix glib >/dev/null 2>&1; then
+            brew install glib || true
+          fi
+
+          glib_prefix="$(brew --prefix glib)"
+          test -f "$glib_prefix/lib/libglib-2.0.0.dylib"
+          test -f "$glib_prefix/lib/libgmodule-2.0.0.dylib"
 
       - name: Install dependencies (Homebrew)
         run: |
           brew update
-          brew bundle
+          # `brew bundle` installs formulae concurrently, so sdl3 (which depends on
+          # cmake) races the cmake entry for the cmake lock and intermittently fails
+          # ("a `brew install --formula sdl3` process has already locked .../cmake").
+          # Install the shared build dependency first, then retry the bundle once to
+          # ride out any remaining transient lock contention.
+          brew install cmake || true
+          brew bundle || { sleep 10; brew bundle; }
 
       - name: Download QEMU-UAE plugin
         run: .github/scripts/download-qemu-uae-plugin.sh qemu-uae-macos-universal.zip
