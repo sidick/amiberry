@@ -27,6 +27,7 @@
 #include "options.h"
 #include "keyboard.h"
 #include "inputdevice.h"
+#include "amiberry_input_helpers.h"
 
 #include <algorithm>
 #include "inputrecord.h"
@@ -2451,6 +2452,8 @@ static int lastmxy_abs[2][2];
 static uaecptr magicmouse_ibase, magicmouse_gfxbase;
 static int dimensioninfo_width, dimensioninfo_height, dimensioninfo_dbl;
 static int vp_xoffset, vp_yoffset, mouseoffset_x, mouseoffset_y;
+static bool mousehack_host_cursor_uses_hotspot;
+static int mousehack_host_cursor_residual_x, mousehack_host_cursor_residual_y;
 static int tablet_maxx, tablet_maxy, tablet_maxz;
 static int tablet_resx, tablet_resy;
 static int tablet_maxax, tablet_maxay, tablet_maxaz;
@@ -2576,6 +2579,8 @@ static void mousehack_reset (void)
 {
 	dimensioninfo_width = dimensioninfo_height = 0;
 	mouseoffset_x = mouseoffset_y = 0;
+	mousehack_host_cursor_uses_hotspot = false;
+	mousehack_host_cursor_residual_x = mousehack_host_cursor_residual_y = 0;
 	dimensioninfo_dbl = 0;
 	mousehack_alive_cnt = 0;
 	vp_xoffset = vp_yoffset = 0;
@@ -2643,6 +2648,26 @@ void input_mousehack_mouseoffset(uaecptr pointerprefs)
 	mouseoffset_y = (uae_s16)get_word (pointerprefs + 30);
 }
 
+void input_mousehack_cursor_hotspot(int cursor_width, int cursor_height, int* hotspot_x, int* hotspot_y,
+	int* residual_x, int* residual_y)
+{
+	amiberry_input_mousehack_cursor_hotspot(mouseoffset_x, mouseoffset_y, cursor_width, cursor_height,
+		hotspot_x, hotspot_y);
+	if (residual_x) {
+		*residual_x = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_x, cursor_width, 1);
+	}
+	if (residual_y) {
+		*residual_y = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_y, cursor_height, 2);
+	}
+}
+
+void input_mousehack_set_host_cursor_uses_hotspot(bool enabled, int residual_x, int residual_y)
+{
+	mousehack_host_cursor_uses_hotspot = enabled;
+	mousehack_host_cursor_residual_x = enabled ? residual_x : 0;
+	mousehack_host_cursor_residual_y = enabled ? residual_y : 0;
+}
+
 static bool get_mouse_position(int *xp, int *yp, int inx, int iny)
 {
 	extern int mouse_monid;
@@ -2679,22 +2704,11 @@ static bool get_mouse_position(int *xp, int *yp, int inx, int iny)
 		y = (int)(y * fmy);
 		x -= (int)(fdx * 1.0) - 0;
 		y -= (int)(fdy * 1.0) - 2;
-		if (x < 0) {
-			ob = true;
-			x = 0;
-		}
-		if (x * fmx >= vidinfo->outbuffer->outwidth) {
-			ob = true;
-			x = vidinfo->outbuffer->outwidth - 1;
-		}
-		if (y < 0) {
-			ob = true;
-			y = 0;
-		}
-		if (y * fmy >= vidinfo->outbuffer->outheight) {
-			ob = true;
-			y = vidinfo->outbuffer->outheight - 1;
-		}
+		bool axis_ob = false;
+		x = amiberry_input_clamp_native_axis(x, vidinfo->outbuffer->outwidth, &axis_ob);
+		ob |= axis_ob;
+		y = amiberry_input_clamp_native_axis(y, vidinfo->outbuffer->outheight, &axis_ob);
+		ob |= axis_ob;
 		if (currprefs.gfx_resolution == RES_LORES) {
 			x *= 2;
 		} else if (currprefs.gfx_resolution == RES_SUPERHIRES) {
@@ -3001,8 +3015,13 @@ void inputdevice_tablet_info (int maxx, int maxy, int maxz, int maxax, int maxay
 
 static void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits)
 {
-	x -= mouseoffset_x + 1;
-	y -= mouseoffset_y + 2;
+	if (mousehack_host_cursor_uses_hotspot) {
+		x -= mousehack_host_cursor_residual_x;
+		y -= mousehack_host_cursor_residual_y;
+	} else {
+		x -= mouseoffset_x + 1;
+		y -= mouseoffset_y + 2;
+	}
 
 	mousehack_enable ();
 	if (mousehack_address) {
