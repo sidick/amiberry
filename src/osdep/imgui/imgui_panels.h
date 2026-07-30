@@ -15,6 +15,37 @@ extern std::vector<const char*> qs_models;
 extern std::vector<const char*> qs_configs;
 extern ImTextureID about_logo_texture;
 
+// Shared catalogs used by panels that expose the same choices.
+const std::vector<std::string>& get_sound_device_names();
+const std::vector<std::string>& get_available_theme_names();
+const std::vector<std::string>& get_available_bezel_names();
+
+struct InputDeviceOption
+{
+	std::string label;
+	std::string config_value;
+	int id;
+};
+
+const std::vector<InputDeviceOption>& get_input_device_options();
+bool InputDeviceCombo(const char* id, int current_index, const char* fallback_preview,
+	int* selected_index);
+
+inline constexpr int SOUND_BUFFER_SIZES[] = {
+	1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 32768, 65536
+};
+
+inline int get_sound_buffer_size_index(const int size)
+{
+	if (size < SOUND_BUFFER_SIZES[0])
+		return 0;
+
+	int index = 0;
+	while (index + 1 < IM_ARRAYSIZE(SOUND_BUFFER_SIZES) && SOUND_BUFFER_SIZES[index] < size)
+		++index;
+	return index + 1;
+}
+
 // Texture helpers that abstract SDL_Texture (SDLRenderer2) vs GLuint (OpenGL3)
 struct SDL_Surface;
 ImTextureID gui_create_texture(SDL_Surface* surface, int* out_w, int* out_h);
@@ -64,7 +95,10 @@ void render_panel_custom();
 void render_panel_diskswapper();
 void render_panel_misc();
 void render_panel_global_settings();
-// Returns true while the Misc panel's hotkey-capture modal is open.
+// Shared hotkey picker used by panels that edit host keyboard shortcuts.
+bool HotkeyPicker(const char* id, char* config_value, size_t config_value_size);
+void HotkeyCapture_RenderPopup();
+// Returns true while the hotkey-capture modal is open.
 // Used by the GUI main loop to suppress its own keyboard shortcuts while
 // the user is picking a key combination.
 bool HotkeyCapture_IsActive();
@@ -74,6 +108,8 @@ void render_panel_virtual_keyboard();
 void render_panel_whdload();
 void render_panel_themes();
 void render_panel_filter();
+void ShaderParameters_Open(const char* shader_name, bool rtg);
+void ShaderParameters_RenderPopup();
 
 // Controller mapping modal (ImGui)
 void ControllerMap_Open(int device, bool map_touchpad);

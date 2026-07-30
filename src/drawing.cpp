@@ -56,8 +56,6 @@
 
 #define ENABLE_MULTITHREADED_DENISE 1
 
-#define FMODE64_HACK 0
-
 extern int multithread_enabled;
 #define MULTITHREADED_DENISE (ENABLE_MULTITHREADED_DENISE && multithread_enabled != 0)
 
@@ -140,13 +138,12 @@ static void denise_update_reg(uae_u16 reg, uae_u16 v, uae_u32 linecnt);
 static void draw_denise_line(int gfx_ypos, nln_how how, uae_u32 linecnt, int startpos, int startcycle, int endcycle, int skip_start, int skip_end, int dtotal,
 	int calib_start, int calib_len, bool lol, int hdelay, bool blanked, bool borderline, bool finalseg, struct linestate *ls);
 
-static void sprwrite(int reg, uae_u32 v);
+static void sprwrite(int reg, uae_u16 v);
 static void sprwrite_64(int reg, uae_u64 v);
 // 0 = SPRxPOS/CTL, 1 = SPRxDATx
 static int spr_unalign_reg[2];
-static uae_u32 spr_unalign_val[2];
+static uae_u16 spr_unalign_val[2];
 static uae_u64 spr_unalign_val64[2];
-static bool denise_sprfmode64, denise_bplfmode64;
 
 static void quick_denise_rga(uae_u32 linecnt, int startpos, int endpos)
 {
@@ -160,14 +157,16 @@ static void quick_denise_rga(uae_u32 linecnt, int startpos, int endpos)
 			if (spr_unalign_reg[0]) {
 				int sreg = spr_unalign_reg[0] - 0x140;
 				sprwrite(sreg, spr_unalign_val[0]);
+				spr_unalign_reg[0] = 0;
 			}
 			if (spr_unalign_reg[1]) {
 				int sreg = spr_unalign_reg[1] - 0x140;
-				if (denise_sprfmode64) {
+				if (aga_mode) {
 					sprwrite_64(sreg, spr_unalign_val64[1]);
 				} else {
 					sprwrite(sreg, spr_unalign_val[1]);
 				}
+				spr_unalign_reg[1] = 0;
 			}
 		}
 		pos++;
@@ -465,9 +464,7 @@ static int denise_strobe_offset;
 static int denise_visible_lines, denise_visible_lines_counted;
 static uae_u16 hbstrt_denise_reg, hbstop_denise_reg;
 static uae_u16 fmode_denise, denise_bplfmode, denise_sprfmode;
-#if FMODE64_HACK
-static int denise_bplfmode_max;
-#endif
+static bool denise_bplfmode64, denise_sprfmode64;
 static int bpldat_fmode;
 static int fetchmode_size_denise, fetchmode_mask_denise;
 static int delayed_vblank_ecs, delayed_pvblank_aga;
@@ -507,6 +504,7 @@ static uae_u16 clxcon_bpl_match_55, clxcon_bpl_match_aa;
 static int aga_delayed_color_idx;
 static uae_u16 aga_delayed_color_val, aga_delayed_color_con2, aga_delayed_color_con3;
 static int aga_unalign0, aga_unalign1, bpl1dat_unalign, reswitch_unalign;
+static uae_u16 delayed_fmode;
 #if 0
 static int bplcon0_res_unalign, bplcon0_res_unalign_res;
 #endif
@@ -527,15 +525,14 @@ struct denise_spr
 {
 	int num;
 	uae_u16 pos, ctl;
-	uae_u32 dataa, datab;
+	uae_u16 dataa, datab;
 	uae_u64 dataa64, datab64;
 	int xpos, xpos_lores;
 	int armed, armeds;
-	uae_u32 dataas, databs;
+	uae_u16 dataas, databs;
 	uae_u64 dataas64, databs64;
 	bool attached;
 	bool shiftercopydone;
-	int fmode;
 	int shift;
 	int pix;
 };
@@ -2506,6 +2503,15 @@ void drawing_init(void)
 // of std::atomic<float>, with enough precision for a ~1 Hz match tolerance.
 static std::atomic<uint32_t> hw_vsync_cached_monitor_hz_x1000{0};
 
+// Published by the active renderer only after it has successfully configured
+// a presentation mode that blocks for vblank.
+static std::atomic<bool> hw_vsync_cached_presentation_blocking{false};
+
+void amiberry_hw_vsync_pacing_set_blocking(const bool blocking)
+{
+	hw_vsync_cached_presentation_blocking.store(blocking, std::memory_order_relaxed);
+}
+
 // Invoked on the SDL main thread in response to display / window events
 // (window migrated to another display, display mode changed) and once at
 // graphics_init() time. Re-probes SDL and caches the active display's
@@ -2537,13 +2543,15 @@ void amiberry_hw_vsync_pacing_invalidate(void)
 // vulkan_renderer.cpp), so hardware pacing is disabled there unconditionally.
 //
 // This runs on the emulator thread (via isvsync_chipset() → framewait()).
-// It does NOT call any SDL video APIs: it only reads the cached monitor Hz
-// published by amiberry_hw_vsync_pacing_invalidate() on the main thread.
+// It does NOT call any SDL video APIs: it only reads the cached monitor Hz and
+// blocking-presentation capability published by the presentation thread.
 static bool amiberry_hw_vsync_pacing_ok(void)
 {
 #ifdef USE_VULKAN
 	return false;
 #else
+	if (!hw_vsync_cached_presentation_blocking.load(std::memory_order_relaxed))
+		return false;
 	if (vblank_hz <= 0.0f)
 		return false;
 	const uint32_t hz_x1000 = hw_vsync_cached_monitor_hz_x1000.load(std::memory_order_relaxed);
@@ -2557,12 +2565,22 @@ static bool amiberry_hw_vsync_pacing_ok(void)
 // Libretro stub: declaration is visible via xwin.h's AMIBERRY block, so
 // provide an empty body here so callers link without the full pacing logic.
 void amiberry_hw_vsync_pacing_invalidate(void) {}
+void amiberry_hw_vsync_pacing_set_blocking(const bool) {}
 #endif
 
 int isvsync_chipset(void)
 {
 	struct amigadisplay *ad = &adisplays[0];
-	if (ad->picasso_on || currprefs.gfx_apmode[0].gfx_vsync <= 0)
+	if (ad->picasso_on)
+		return 0;
+#if defined(AMIBERRY) && !defined(LIBRETRO) && defined(USE_OPENGL) && !defined(USE_VULKAN)
+	// KMSDRM OpenGL/GLES publishes blocking presentation only on the SDL 3.4+
+	// interval-1 path. A matching console refresh can therefore provide
+	// hardware pacing even when VSync is disabled in the emulation settings.
+	if (kmsdrm_detected && amiberry_hw_vsync_pacing_ok())
+		return 1;
+#endif
+	if (currprefs.gfx_apmode[0].gfx_vsync <= 0)
 		return 0;
 #ifdef AMIBERRY
 #ifndef LIBRETRO
@@ -2821,7 +2839,7 @@ static void sprwrite_64(int reg, uae_u64 v)
 	}
 }
 
-static void sprwrite(int reg, uae_u32 v)
+static void sprwrite(int reg, uae_u16 v)
 {
 	int num = reg / 8;
 	struct denise_spr *s = &dspr[num];
@@ -2837,19 +2855,18 @@ static void sprwrite(int reg, uae_u32 v)
 		s->dataas64 = s->dataa64;
 		s->databs64 = s->datab64;
 		spr_arms(s, 1);
-		s->fmode = denise_sprfmode;
 		s->shiftercopydone = true;
 	}
 
 	if (dat) {
 		if (second) {
 			s->datab = v;
-			if (!denise_sprfmode64) {
+			if (!aga_mode) {
 				s->datab64 = v;
 			}
 		} else {
 			s->dataa = v;
-			if (!denise_sprfmode64) {
+			if (!aga_mode) {
 				s->dataa64 = v;
 			}
 			// if same cycle would arm the sprite and match it, match is missed
@@ -3429,17 +3446,6 @@ static void expand_bplcon0(uae_u16 v)
 	check_lts_request();
 }
 
-#if FMODE64_HACK
-static uae_u64 make6416(uae_u32 v)
-{
-	return ((uae_u64)v << 48) | ((uae_u64)v << 32) | ((uae_u64)v << 16) | ((uae_u64)v);
-}
-static uae_u64 make6432(uae_u32 v)
-{
-	return ((uae_u64)v << 32) | ((uae_u64)v);
-}
-#endif
-
 static void expand_fmode(uae_u16 v)
 {
 	if (!aga_mode) {
@@ -3454,40 +3460,13 @@ static void expand_fmode(uae_u16 v)
 
 	int fm = denise_bplfmode;
 	denise_bplfmode = (v & 3) == 3 ? 2 : (v & 3) == 0 ? 0 : 1;
-#if FMODE64_HACK
-	if (fm != denise_bplfmode) {
-		if (!denise_bplfmode_max) {
-			if (fm < 2) {
-				for (int i = 0; i < MAX_PLANES; i++) {
-					if (fm == 1) {
-						bplxdat_64[i] = make6432(bplxdat[i]);
-						bplxdat2_64[i] = make6432(bplxdat2[i]);
-						bplxdat3_64[i] = make6432(bplxdat3[i]);
-					} else {
-						bplxdat_64[i] = make6416(bplxdat[i]);
-						bplxdat2_64[i] = make6416(bplxdat2[i]);
-						bplxdat3_64[i] = make6416(bplxdat3[i]);
-					}
-				}
-			}
-			lts_request = true;
-		}
-		denise_bplfmode_max = 2;
-	}
-#endif
 	v >>= 2;
 	denise_sprfmode = (v & 3) == 3 ? 2 : (v & 3) == 0 ? 0 : 1;
 	denise_sprfmode64 = denise_sprfmode == 2;
 	denise_bplfmode64 = denise_bplfmode == 2;
-#if FMODE64_HACK
-	if (denise_bplfmode_max) {
-		denise_bplfmode64 = true;
-	}
-#endif
 	update_fmode();
 	check_lts_request();
 }
-
 
 static void expand_colmask(void)
 {
@@ -3608,6 +3587,7 @@ void denise_reset(bool hard)
 		denise_res = 0;
 		denise_planes = 0;
 		fmode_denise = 0;
+		delayed_fmode = 0;
 		bplcon0_denise = 0;
 		bplcon3_denise = 0x0c00;
 		bplcon4_denise = 0x0011;
@@ -3795,14 +3775,6 @@ static void hstart_new(void)
 		}
 #endif
 	}
-#if FMODE64_HACK
-	if (denise_bplfmode_max > 0) {
-		denise_bplfmode_max--;
-		if (!denise_bplfmode_max) {
-			select_lts();
-		}
-	}
-#endif
 }
 
 static void do_exthblankon_ecs(void)
@@ -3868,25 +3840,14 @@ static void bpl1dat_enable_bpls(void)
 static void bpldat_docopy(void)
 {
 	if (aga_mode) {
-		if (denise_bplfmode64) {
-			bplxdat2_64[0] = bplxdat_64[0];
-			bplxdat2_64[1] = bplxdat_64[1];
-			bplxdat2_64[2] = bplxdat_64[2];
-			bplxdat2_64[3] = bplxdat_64[3];
-			bplxdat2_64[4] = bplxdat_64[4];
-			bplxdat2_64[5] = bplxdat_64[5];
-			bplxdat2_64[6] = bplxdat_64[6];
-			bplxdat2_64[7] = bplxdat_64[7];
-		} else {
-			bplxdat2[0] = bplxdat[0];
-			bplxdat2[1] = bplxdat[1];
-			bplxdat2[2] = bplxdat[2];
-			bplxdat2[3] = bplxdat[3];
-			bplxdat2[4] = bplxdat[4];
-			bplxdat2[5] = bplxdat[5];
-			bplxdat2[6] = bplxdat[6];
-			bplxdat2[7] = bplxdat[7];
-		}
+		bplxdat2_64[0] = bplxdat_64[0];
+		bplxdat2_64[1] = bplxdat_64[1];
+		bplxdat2_64[2] = bplxdat_64[2];
+		bplxdat2_64[3] = bplxdat_64[3];
+		bplxdat2_64[4] = bplxdat_64[4];
+		bplxdat2_64[5] = bplxdat_64[5];
+		bplxdat2_64[6] = bplxdat_64[6];
+		bplxdat2_64[7] = bplxdat_64[7];
 	} else {
 		bplxdat2[0] = bplxdat[0];
 		bplxdat2[1] = bplxdat[1];
@@ -3937,7 +3898,6 @@ static void expand_drga_early2x(struct denise_rga *rd)
 		case 0x17c: case 0x17e:
 		{
 			spr_unalign_reg[1] = rd->rga;
-			spr_unalign_val[1] = rd->v;
 			spr_unalign_val64[1] = rd->v64;
 		}
 		break;
@@ -4020,6 +3980,13 @@ static void expand_drga_early(struct denise_rga *rd)
 			}
 		}
 		denise_vsync_bpl_detect = false;
+		break;
+
+		case 0x1fc:
+		if (rd->v != delayed_fmode) {
+			delayed_fmode = rd->v;
+			aga_unalign1++;
+		}
 		break;
 	}
 
@@ -4185,16 +4152,8 @@ static void expand_drga(struct denise_rga *rd)
 		set_strlong();
 		break;
 		case 0x110:
-		if (denise_bplfmode64) {
-#if FMODE64_HACK
-			if (denise_bplfmode < 2) {
-				bplxdat_64[0] = denise_bplfmode == 0 ? make6416(rd->v) : make6432(rd->v);
-			} else {
-				bplxdat_64[0] = rd->v64;
-			}
-#else
+		if (aga_mode) {
 			bplxdat_64[0] = rd->v64;
-#endif
 		} else {
 			bplxdat[0] = rd->v;
 		}
@@ -4214,16 +4173,8 @@ static void expand_drga(struct denise_rga *rd)
 		case 0x11e:
 		{
 			int num = (rd->rga - 0x110) / 2;
-			if (denise_bplfmode64) {
-#if FMODE64_HACK
-				if (denise_bplfmode < 2) {
-					bplxdat_64[num] = denise_bplfmode == 0 ? make6416(rd->v) : make6432(rd->v);;
-				} else {
-					bplxdat_64[num] = rd->v64;
-				}
-#else
+			if (aga_mode) {
 				bplxdat_64[num] = rd->v64;
-#endif
 			} else {
 				bplxdat[num] = rd->v;
 			}
@@ -4264,9 +4215,6 @@ static void expand_drga(struct denise_rga *rd)
 				calchdiw();
 			}
 		}
-		break;
-		case 0x1fc:
-		expand_fmode(rd->v);
 		break;
 		case 0x098:
 		expand_clxcon(rd->v);
@@ -4556,7 +4504,11 @@ static uae_u8 denise_render_sprites2(uae_u8 apixel, uae_u32 vs)
 	if (currprefs.collision_level) {
 		denise_collide_sprites(apixel, vs);
 	}
+#ifdef AMIBERRY
+	// Host Only keeps chipset sprite 0 available for collision and cursor
+	// extraction, but removes it from the rendered Denise output.
 	vs &= magic_sprite_mask;
+#endif
 	uae_u8 c = vs >> 16;
 	uae_u16 v = (uae_u16)vs;
 	int *shift_lookup = bpldualpf ? (bpldualpfpri ? dblpf_ms2 : dblpf_ms1) : dblpf_ms;
@@ -4671,12 +4623,13 @@ static void denise_shift_sprites_aga(int shift)
 	int sidx = 0;
 	while (dprspts[sidx]) {
 		struct denise_spr *sp = dprspts[sidx];
-		if (denise_sprfmode64) {
-			sp->dataas64 <<= shift;
-			sp->databs64 <<= shift;
-		} else {
-			sp->dataas <<= shift;
-			sp->databs <<= shift;
+		sp->dataas64 <<= shift;
+		sp->databs64 <<= shift;
+		if (!denise_sprfmode64) {
+			// if not 64-bit FMODE: clear any bits shifted from bits 32-63.
+			uae_u64 mask = ((uae_u64)((1 << shift) - 1)) << 32;
+			sp->dataas64 &= ~mask;
+			sp->databs64 &= ~mask;
 		}
 		sidx++;
 	}
@@ -4702,26 +4655,20 @@ static uae_u32 denise_render_sprites_aga(int add)
 				shift = sp->shift < -denise_spr_shiftsize ? 4 : 2;
 			}
 			sp->shift = denise_spr_shiftsize;
-			if (denise_sprfmode64) {
-				if (!sp->dataas64 && !sp->databs64) {
-					d |= 1 << num;
-				} else if (num > 0) {
-					asp = true;
-				}
-				sp->pix = ((sp->dataas64 >> 63) & 1) << 0;
-				sp->pix |= ((sp->databs64 >> 63) & 1) << 1;
-				sp->dataas64 <<= shift;
-				sp->databs64 <<= shift;
-			} else {
-				if (!sp->dataas && !sp->databs) {
-					d |= 1 << num;
-				} else if (num > 0) {
-					asp = true;
-				}
-				sp->pix = ((sp->dataas >> 31) & 1) << 0;
-				sp->pix |= ((sp->databs >> 31) & 1) << 1;
-				sp->dataas <<= shift;
-				sp->databs <<= shift;
+			if (!sp->dataas64 && !sp->databs64) {
+				d |= 1 << num;
+			} else if (num > 0) {
+				asp = true;
+			}
+			sp->pix = ((sp->dataas64 >> 63) & 1) << 0;
+			sp->pix |= ((sp->databs64 >> 63) & 1) << 1;
+			sp->dataas64 <<= shift;
+			sp->databs64 <<= shift;
+			if (!denise_sprfmode64) {
+				// if not 64-bit FMODE: clear any bits shifted from bits 32-63.
+				uae_u64 mask = ((uae_u64)((1 << shift) - 1)) << 32;
+				sp->dataas64 &= ~mask;
+				sp->databs64 &= ~mask;
 			}
 		}
 		sidx++;
@@ -4753,8 +4700,8 @@ static uae_u32 denise_render_sprites(void)
 			if (!sp->dataas && !sp->databs) {
 				d |= 1 << num;
 			}
-			sp->pix = ((sp->dataas >> 31) & 1) << 0;
-			sp->pix |= ((sp->databs >> 31) & 1) << 1;
+			sp->pix = ((sp->dataas >> 15) & 1) << 0;
+			sp->pix |= ((sp->databs >> 15) & 1) << 1;
 			sp->dataas <<= 1;
 			sp->databs <<= 1;
 		}
@@ -4779,8 +4726,8 @@ static uae_u32 denise_render_sprites_lores(void)
 		if (!sp->dataas && !sp->databs) {
 			d |= 1 << num;
 		}
-		sp->pix = ((sp->dataas >> 31) & 1) << 0;
-		sp->pix |= ((sp->databs >> 31) & 1) << 1;
+		sp->pix = ((sp->dataas >> 15) & 1) << 0;
+		sp->pix |= ((sp->databs >> 15) & 1) << 1;
 		sp->dataas <<= 1;
 		sp->databs <<= 1;
 		sidx++;
@@ -4807,8 +4754,8 @@ static uae_u32 denise_render_sprites_ecs_shres(void)
 			if (!sp->dataas && !sp->databs) {
 				d |= 1 << num;
 			}
-			sp->pix = ((sp->dataas >> 31) & 1) << 0;
-			sp->pix |= ((sp->databs >> 31) & 1) << 1;
+			sp->pix = ((sp->dataas >> 15) & 1) << 0;
+			sp->pix |= ((sp->databs >> 15) & 1) << 1;
 			sp->dataas <<= 1;
 			sp->databs <<= 1;
 		}
@@ -5347,13 +5294,12 @@ static void matchsprites2(int cnt)
 
 					// ECS Denise + hires sprite bit and hires: leftmost pixel is missing
 					if (ecs_denise_only && denise_res == RES_HIRES && (sp->ctl & 0x10)) {
-						sp->dataas &= 0x7fffffff;
-						sp->databs &= 0x7fffffff;
+						sp->dataas &= 0x7fff;
+						sp->databs &= 0x7fff;
 					}
 
 					if (sp->dataas || sp->databs) {
 						spr_arms(sp, 1);
-						sp->fmode = denise_sprfmode;
 					}
 				}
 			}
@@ -5376,7 +5322,6 @@ static void matchsprites2_ecs_shres(int cnt)
 					sp->databs = sp->datab;
 					if (sp->dataas || sp->databs) {
 						spr_arms(sp, 1);
-						sp->fmode = denise_sprfmode;
 					}
 				}
 			}
@@ -5412,20 +5357,10 @@ static void matchsprites2_aga(int cnt)
 				if (sp->shiftercopydone) {
 					sp->shiftercopydone = false;
 				} else {
-					if (denise_sprfmode64) {
-						sp->dataas64 = sp->dataa64;
-						sp->databs64 = sp->datab64;
-						if (sp->dataas64 || sp->databs64) {
-							spr_arms(sp, 1);
-							sp->fmode = denise_sprfmode;
-						}
-					} else {
-						sp->dataas = sp->dataa;
-						sp->databs = sp->datab;
-						if (sp->dataas || sp->databs) {
-							spr_arms(sp, 1);
-							sp->fmode = denise_sprfmode;
-						}
+					sp->dataas64 = sp->dataa64;
+					sp->databs64 = sp->datab64;
+					if (sp->dataas64 || sp->databs64) {
+						spr_arms(sp, 1);
 					}
 				}
 			}
@@ -6410,10 +6345,6 @@ bool denise_get_hboffsets(int *hbs, int *hbe, int *hblen, int *total)
 #include "linetoscr_aga_fm0.cpp"
 #include "linetoscr_aga_fm1.cpp"
 #include "linetoscr_aga_fm2.cpp"
-#if FMODE64_HACK
-#include "linetoscr_aga_fm0_64.cpp"
-#include "linetoscr_aga_fm1_64.cpp"
-#endif
 #include "linetoscr_aga_fm0_genlock.cpp"
 #include "linetoscr_aga_fm1_genlock.cpp"
 #include "linetoscr_aga_fm2_genlock.cpp"
@@ -6494,11 +6425,6 @@ static void select_lts(void)
 					lts = linetoscr_aga_funcs[idx];
 				}
 			} else {
-#if FMODE64_HACK
-				if (denise_bplfmode_max && bpldat_fmode < 2) {
-					idx += 3 * 2 * 5 * 4 * 2 * 3 * 3;
-				}
-#endif
 				lts = linetoscr_aga_funcs[idx];
 			}
 		}
@@ -6581,16 +6507,9 @@ static void select_lts(void)
 	denise_hcounter_prev = denise_hcounter;
 }
 
-STATIC_INLINE uae_u8 getbpl(void)
+STATIC_INLINE uae_u8 getbpl_aga(void)
 {
-	uae_u8 pix;
-	if (denise_bplfmode == 2) {
-		pix = getbpl8_64();
-	} else if (denise_bplfmode == 1) {
-		pix = getbpl8_32();
-	} else {
-		pix = getbpl8();
-	}
+	uae_u8 pix = getbpl8_64();
 	return pix;
 }
 
@@ -6656,11 +6575,7 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 
 				if (spr_unalign_reg[1]) {
 					int sreg = spr_unalign_reg[1] - 0x140;
-					if (denise_sprfmode64) {
-						sprwrite_64(sreg, spr_unalign_val64[1]);
-					} else {
-						sprwrite(sreg, spr_unalign_val[1]);
-					}
+					sprwrite_64(sreg, spr_unalign_val64[1]);
 					spr_unalign_reg[1] = 0;
 				}
 				if (spr_unalign_reg[0]) {
@@ -6668,6 +6583,10 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 					matchsprites2_aga(cnt);
 					sprwrite(sreg, spr_unalign_val[0]);
 					spr_unalign_reg[0] = 0;
+				}
+
+				if (delayed_fmode != fmode_denise) {
+					expand_fmode(delayed_fmode);
 				}
 			}
 
@@ -6721,9 +6640,9 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 				if (denise_bplfmode64) {
 					shiftbpl8_64();
 				} else {
-					shiftbpl8();
+					shiftbpl8_32();
 				}
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 		} else {
 			// even planes shifting
@@ -6733,9 +6652,9 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 				if (denise_bplfmode64) {
 					shiftbpl8e_64();
 				} else {
-					shiftbpl8e();
+					shiftbpl8e_32();
 				}
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 			// odd planes shifting
 			bplshiftcnt[1] += denise_res_size2;
@@ -6744,9 +6663,9 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 				if (denise_bplfmode64) {
 					shiftbpl8o_64();
 				} else {
-					shiftbpl8o();
+					shiftbpl8o_32();
 				}
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 		}
 
@@ -6754,34 +6673,22 @@ static void lts_unaligned_aga(int cnt, int cnt_next, int h)
 		if (!denise_odd_even) {
 			// both even and odd planes copy
 			if (bpldat_copy[0] && dhv == bplcon1_shift_full[0]) {
-				if (denise_bplfmode64) {
-					copybpl8_64();
-				} else {
-					copybpl8();
-				}
+				copybpl8_64();
 				bplshiftcnt[0] = 0;
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 		} else {
 			// even planes copy
 			if (bpldat_copy[0] && dhv == bplcon1_shift_full[0]) {
-				if (denise_bplfmode64) {
-					copybpl8e_64();
-				} else {
-					copybpl8e();
-				}
+				copybpl8e_64();
 				bplshiftcnt[0] = 0;
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 			// odd planes copy
 			if (bpldat_copy[1] && dhv == bplcon1_shift_full[1]) {
-				if (denise_bplfmode64) {
-					copybpl8o_64();
-				} else {
-					copybpl8o();
-				}
+				copybpl8o_64();
 				bplshiftcnt[1] = 0;
-				loaded_pix = getbpl();
+				loaded_pix = getbpl_aga();
 			}
 		}
 
@@ -8156,7 +8063,7 @@ uae_u8 *save_custom_sprite_denise(int num, uae_u8 *dst)
 {
 	struct denise_spr *s = &dspr[num];
 
-	if (denise_sprfmode64) {
+	if (aga_mode) {
 		SW(s->dataa64 >> 48);
 		SW(s->datab64 >> 48);
 		SW((uae_u16)(s->dataa64 >> 32));
@@ -8166,8 +8073,8 @@ uae_u8 *save_custom_sprite_denise(int num, uae_u8 *dst)
 		SW((uae_u16)(s->dataa64 >>  0));
 		SW((uae_u16)(s->datab64 >>  0));
 	} else {
-		SW(s->dataa >> 16);
-		SW(s->datab >> 16);
+		SW(s->dataa);
+		SW(s->datab);
 		SW(0);
 		SW(0);
 		SW(0);
@@ -8175,7 +8082,7 @@ uae_u8 *save_custom_sprite_denise(int num, uae_u8 *dst)
 		SW(0);
 		SW(0);
 	}
-	uae_u8 f = (s->armed ? 1 : 0) | (s->fmode << 1);
+	uae_u8 f = (s->armed ? 1 : 0) | (denise_sprfmode << 1);
 	SB(f);
 
 	return dst;
@@ -8200,14 +8107,13 @@ uae_u8 *restore_custom_sprite_denise(int num, uae_u8 *src, uae_u16 pos, uae_u16 
 
 	uae_u8 f = RB;
 	int armed = f & 1;
-	s->fmode = (f >> 1) & 3;
-	s->dataa = data[0] << 16;
-	s->datab = datb[0] << 16;
+	s->dataa = data[0];
+	s->datab = datb[0];
 	s->dataa64 = (data[0] << 16) | (data[1]);
 	s->datab64 = (datb[0] << 16) | (datb[1]);
 	spr_arm(s, armed);
 
-	if (denise_sprfmode64) {
+	if (aga_mode) {
 		s->dataa64 <<= 32;
 		s->datab64 <<= 32;
 		s->dataa64 |= (data[2] << 16) | (data[3]);

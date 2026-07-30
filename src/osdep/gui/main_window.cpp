@@ -40,6 +40,7 @@
 #include "tinyxml2.h"
 #include "file_dialog.h"
 #include "macos_window.h"
+#include "amiberry_rp9.h"
 
 #ifdef USE_IMGUI
 #include "imgui.h"
@@ -1045,19 +1046,16 @@ bool BeginGroupBox(const char* name, bool collapsible, bool default_open)
 		bool open = storage->GetBool(id, default_open);
 		const char* arrow = open ? ICON_FA_CHEVRON_DOWN : ICON_FA_CHEVRON_RIGHT;
 		std::string toggle_label = std::string(arrow) + " " + name;
-		if (ImGui::Selectable(toggle_label.c_str(), false, 0, ImVec2(0, ImGui::GetTextLineHeightWithSpacing()))) {
+		// Selectable treats zero width as the remaining window width, which lets
+		// a group header's hover highlight spill across sibling columns.
+		const float toggle_width = ImGui::CalcTextSize(toggle_label.c_str()).x
+			+ ImGui::GetStyle().FramePadding.x * 2.0f;
+		if (ImGui::Selectable(toggle_label.c_str(), false, 0,
+			ImVec2(toggle_width, ImGui::GetTextLineHeightWithSpacing()))) {
 			open = !open;
 			storage->SetBool(id, open);
 		}
 		if (!open) {
-			// When collapsed the header Selectable is the group's only/last item.
-			// A Selectable sizes its render/click rect to the full available width
-			// (WorkRect.Max.x), and ImGui::EndGroup() folds the last item's rect
-			// into the group's bounding box. That full-width rect would otherwise
-			// leak into the enclosing layout and push a side-by-side column off
-			// screen (issue #2118). Submit a zero-size item so the collapsed group
-			// reports a sane width based on the header label only.
-			ImGui::Dummy(ImVec2(0.0f, 0.0f));
 			g_groupbox_collapsed = true;
 			return false;
 		}
@@ -1898,9 +1896,9 @@ static void handle_drop_file_event(const SDL_Event& event)
 	const char* dropped_file = event.drop.data;
 	const auto ext = get_filename_extension(dropped_file);
 
-	if (strcasecmp(ext.c_str(), ".uae") == 0)
+	if (strcasecmp(ext.c_str(), ".uae") == 0 || strcasecmp(ext.c_str(), ".rp9") == 0)
 	{
-		// Load configuration file
+		// Load configuration or self-contained RP9 package
 		uae_restart(&currprefs, -1, dropped_file);
 		gui_running = false;
 	}
@@ -2074,12 +2072,12 @@ void run_gui()
 	// Main loop
 	while (gui_running) {
 		while (SDL_PollEvent(&gui_event)) {
-			// Make sure ImGui sees all events
-			ImGui_ImplSDL3_ProcessEvent(&gui_event);
-
 			if (ControllerMap_HandleEvent(gui_event)) {
 				continue;
 			}
+
+			// Make sure ImGui sees all unconsumed events
+			ImGui_ImplSDL3_ProcessEvent(&gui_event);
 
 			if (gui_event.type == SDL_EVENT_QUIT)	{
 				uae_quit();
@@ -2120,7 +2118,7 @@ void run_gui()
 			else if (gui_event.type == SDL_EVENT_JOYSTICK_ADDED
 				|| gui_event.type == SDL_EVENT_JOYSTICK_REMOVED) {
 				handle_joy_device_event(gui_event.jdevice.which,
-					gui_event.type == SDL_EVENT_JOYSTICK_REMOVED, &changed_prefs);
+					gui_event.type == SDL_EVENT_JOYSTICK_REMOVED);
 			}
 			else if (gui_event.type == SDL_EVENT_WINDOW_MOVED
 				&& gui_event.window.windowID == SDL_GetWindowID(mon->gui_window)) {
@@ -2559,8 +2557,7 @@ void run_gui()
 						const bool active_in = (last_active_panel >= sidebar_groups[g].first_index &&
 							last_active_panel < g_end);
 						group_collapsed = collapsible && section_collapsed[g] && !has_filter && !active_in;
-						ImVec4 label_col = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
-						label_col.w *= 0.7f;
+						const ImVec4 label_col = ImGui::GetStyleColorVec4(ImGuiCol_Text);
 						std::string upper_label;
 						for (const char* c = sidebar_groups[g].label; *c; ++c)
 							upper_label += static_cast<char>(toupper(static_cast<unsigned char>(*c)));
@@ -2694,13 +2691,17 @@ void run_gui()
 		ImGui::SameLine();
 		if (AmigaButton(ICON_FA_ARROWS_ROTATE " Reload", ImVec2(BUTTON_WIDTH, BUTTON_HEIGHT))) {
 			char tmp[MAX_DPATH] = {0};
-			get_configuration_path(tmp, sizeof tmp);
-			if (strlen(last_loaded_config) > 0) {
-				strncat(tmp, last_loaded_config, MAX_DPATH - 1);
-				strncat(tmp, ".uae", MAX_DPATH - 10);
+			if (!rp9_get_loaded_path().empty()) {
+				strncpy(tmp, rp9_get_loaded_path().c_str(), MAX_DPATH - 1);
 			} else {
-				strncat(tmp, OPTIONSFILENAME, MAX_DPATH - 1);
-				strncat(tmp, ".uae", MAX_DPATH - 10);
+				get_configuration_path(tmp, sizeof tmp);
+				if (strlen(last_loaded_config) > 0) {
+					strncat(tmp, last_loaded_config, MAX_DPATH - 1);
+					strncat(tmp, ".uae", MAX_DPATH - 10);
+				} else {
+					strncat(tmp, OPTIONSFILENAME, MAX_DPATH - 1);
+					strncat(tmp, ".uae", MAX_DPATH - 10);
+				}
 			}
 			uae_restart(&changed_prefs, -1, tmp);
 			gui_running = false;
@@ -2744,14 +2745,26 @@ void run_gui()
 		}
 
 		if (show_message_box) {
-            // Center the dialog on appearing; use viewport-relative sizes for proper scaling on all platforms
-            const float vw = vp->Size.x;
-            const float vh = vp->Size.y;
-            const float desired_w = vw * 0.56f;
-            ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
-            ImGui::SetNextWindowSize(ImVec2(desired_w, 0.0f), ImGuiCond_Appearing);
-            // Lock width to desired_w; allow height to grow up to 85% viewport
-            ImGui::SetNextWindowSizeConstraints(ImVec2(desired_w, 0.0f), ImVec2(desired_w, vh * 0.85f));
+			// Size short notices to their content while keeping long help and error text scrollable.
+			const float vw = vp->Size.x;
+			const float vh = vp->Size.y;
+			const auto& style = ImGui::GetStyle();
+			const float max_dialog_w = vw * 0.56f;
+			const float min_dialog_w = std::min(BUTTON_WIDTH * 2.75f, max_dialog_w);
+			const float title_w = ImGui::CalcTextSize(message_box_title).x
+				+ ImGui::GetFrameHeight() * 2.0f + style.WindowPadding.x * 2.0f;
+			const float message_w = ImGui::CalcTextSize(message_box_message.c_str()).x
+				+ style.WindowPadding.x * 2.0f + style.ScrollbarSize;
+			const float desired_w = std::clamp(std::max(title_w, message_w), min_dialog_w, max_dialog_w);
+			const float wrap_w = std::max(1.0f, desired_w - style.WindowPadding.x * 2.0f
+				- style.ScrollbarSize);
+			const float message_h = ImGui::CalcTextSize(message_box_message.c_str(), nullptr, false, wrap_w).y;
+			const float max_child_h = vh * 0.65f;
+			const float child_h = std::min(std::max(message_h + style.FramePadding.y * 2.0f,
+				ImGui::GetTextLineHeightWithSpacing()), max_child_h);
+			ImGui::SetNextWindowPos(vp->GetCenter(), ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+			ImGui::SetNextWindowSize(ImVec2(desired_w, 0.0f), ImGuiCond_Appearing);
+			ImGui::SetNextWindowSizeConstraints(ImVec2(desired_w, 0.0f), ImVec2(desired_w, vh * 0.85f));
 
             // Open the popup once on the rising edge. Calling OpenPopup() every frame
             // made the dialog impossible to dismiss whenever a caller kept re-requesting
@@ -2764,9 +2777,8 @@ void run_gui()
 
             if (ImGui::BeginPopupModal(message_box_title, &message_box_open, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoSavedSettings))
             {
-                // Scrollable message area; height scales with viewport
-                const float max_child_h = vh * 0.65f;
-                ImGui::BeginChild("MessageScroll", ImVec2(0, max_child_h), true, ImGuiWindowFlags_HorizontalScrollbar);
+				// Scroll only when wrapped content reaches the viewport-relative height cap.
+				ImGui::BeginChild("MessageScroll", ImVec2(0, child_h), true);
                 ImGui::TextWrapped("%s", message_box_message.c_str());
                 ImGui::EndChild();
 
@@ -2961,36 +2973,38 @@ void run_gui()
 
 		// Rendering
 		ImGui::Render();
+		if (gui_running || !kmsdrm_detected) {
 #ifdef USE_VULKAN
-		if (gui_use_vulkan) {
-			auto* vk = get_vulkan_renderer();
-			if (vk) {
-				vk->render_gui_frame(ImGui::GetDrawData());
-			}
-		} else
+			if (gui_use_vulkan) {
+				auto* vk = get_vulkan_renderer();
+				if (vk) {
+					vk->render_gui_frame(ImGui::GetDrawData());
+				}
+			} else
 #endif
 #ifdef USE_OPENGL
-		if (gui_use_opengl) {
-			const ImGuiIO& gl_io = ImGui::GetIO();
-			glViewport(0, 0,
-				(int)(gl_io.DisplaySize.x * gl_io.DisplayFramebufferScale.x),
-				(int)(gl_io.DisplaySize.y * gl_io.DisplayFramebufferScale.y));
-			glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
-			glClear(GL_COLOR_BUFFER_BIT);
-			ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-			SDL_GL_SwapWindow(mon->gui_window);
-		} else
+			if (gui_use_opengl) {
+				const ImGuiIO& gl_io = ImGui::GetIO();
+				glViewport(0, 0,
+					(int)(gl_io.DisplaySize.x * gl_io.DisplayFramebufferScale.x),
+					(int)(gl_io.DisplaySize.y * gl_io.DisplayFramebufferScale.y));
+				glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
+				glClear(GL_COLOR_BUFFER_BIT);
+				ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+				SDL_GL_SwapWindow(mon->gui_window);
+			} else
 #endif
-		{
-			const ImGuiIO& render_io = ImGui::GetIO();
-			const float render_scale_x = kmsdrm_detected ? 1.0f : render_io.DisplayFramebufferScale.x;
-			const float render_scale_y = kmsdrm_detected ? 1.0f : render_io.DisplayFramebufferScale.y;
-			SDL_SetRenderScale(mon->gui_renderer, render_scale_x, render_scale_y);
-			SDL_SetRenderDrawColor(mon->gui_renderer, static_cast<uint8_t>(0.45f * 255), static_cast<uint8_t>(0.55f * 255),
-							   static_cast<uint8_t>(0.60f * 255), static_cast<uint8_t>(1.00f * 255));
-			SDL_RenderClear(mon->gui_renderer);
-			ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), mon->gui_renderer);
-			SDL_RenderPresent(mon->gui_renderer);
+			{
+				const ImGuiIO& render_io = ImGui::GetIO();
+				const float render_scale_x = kmsdrm_detected ? 1.0f : render_io.DisplayFramebufferScale.x;
+				const float render_scale_y = kmsdrm_detected ? 1.0f : render_io.DisplayFramebufferScale.y;
+				SDL_SetRenderScale(mon->gui_renderer, render_scale_x, render_scale_y);
+				SDL_SetRenderDrawColor(mon->gui_renderer, static_cast<uint8_t>(0.45f * 255), static_cast<uint8_t>(0.55f * 255),
+								   static_cast<uint8_t>(0.60f * 255), static_cast<uint8_t>(1.00f * 255));
+				SDL_RenderClear(mon->gui_renderer);
+				ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), mon->gui_renderer);
+				SDL_RenderPresent(mon->gui_renderer);
+			}
 		}
 	}
 

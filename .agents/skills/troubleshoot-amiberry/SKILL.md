@@ -1,6 +1,6 @@
 ---
 name: troubleshoot-amiberry
-description: Use when investigating, reproducing, or fixing Amiberry bugs, especially renderer or input regressions, RTG/Picasso96 pixel-format or presentation bugs, HiDPI or SDL3 logical-presentation bugs, Vulkan capability or swapchain failures, MHI/audio playback regressions, threaded device shutdown hangs, OS4 filesystem packet fallback issues, PPC/QEMU runtime performance regressions, crash regressions, or behavior regressions. Follow an edit-build-run-test-fix cycle, using Amiberry MCP runtime-control tools when they are configured and falling back to normal process, log, screenshot, and debugger tools otherwise.
+description: Use when investigating, reproducing, or fixing Amiberry bugs, especially renderer or input regressions, RTG/Picasso96 pixel-format or presentation bugs, HiDPI or SDL3 logical-presentation bugs, Android SDL Java/JNI version mismatches, Vulkan capability or swapchain failures, libretro headless stub or link regressions, MHI/audio playback regressions, threaded device shutdown hangs, OS4 filesystem packet fallback issues, PPC/QEMU runtime performance regressions, crash regressions, or behavior regressions. Follow an edit-build-run-test-fix cycle, using Amiberry MCP runtime-control tools when they are configured and falling back to normal process, log, screenshot, and debugger tools otherwise.
 ---
 
 # Amiberry Autonomous Troubleshooting
@@ -58,6 +58,20 @@ ninja -j12
 - x86-64 JIT is supported on Windows; for high-natmem, pointer-width, or performance regressions use the `amiberry-x86-jit` skill
 - PowerShell `$env:` variables get stripped in bash inline commands; use `.ps1` files with `-File`
 
+### Libretro standalone core
+
+The standalone Makefile does not track header dependencies. Use a clean build after changing shared headers, function signatures, or `src/osdep/` call sites.
+
+```bash
+# Linux
+make -C libretro clean
+make -C libretro platform=unix ARCH="$(uname -m)" -j"$(nproc)"
+
+# macOS
+make -C libretro clean
+make -C libretro platform=osx ARCH="$(uname -m)" -j"$(sysctl -n hw.logicalcpu)"
+```
+
 ## Troubleshooting Workflow
 
 ### Phase 1: Understand the Bug
@@ -81,6 +95,7 @@ Read one of these references when the bug matches its trigger. Do not load all r
 | [references/threaded-device-shutdown.md](references/threaded-device-shutdown.md) | Shutdown hangs, joinable worker threads, PCAP/uaenet teardown, or PCem Voodoo FIFO/render thread bugs |
 | [references/os4-filesystem-packets.md](references/os4-filesystem-packets.md) | OS4 filesystem packet compatibility, `filesys.cpp`, `ACTION_EXAMINEDATA*`, or unknown DOS packet fallback bugs |
 | [references/ppc-qemu-runtime.md](references/ppc-qemu-runtime.md) | QEMU-UAE PPC runtime behavior, plugin JIT flush, spinlock, execute-loop, or PPC slowdown bugs |
+| [references/android-sdl-shim.md](references/android-sdl-shim.md) | Android SDL updates, C/Java version mismatch, JNI shim drift, or changes under `org/libsdl/app` |
 
 ### Phase 2: Reproduce
 
@@ -157,6 +172,13 @@ Before editing, decide whether the bug is in a shared subsystem or only one rend
   - present modes and surface formats
 - Prefer "probe, then enable" over hardcoding spec-preferred flags.
 - If the bug involves presentation or scaling, verify both startup and post-resize behavior.
+
+### Phase 4b: Libretro Contract Verification
+
+- Libretro is headless and does not link host GUI implementations. It compiles shared `src/osdep/` callers against replacements such as `libretro/libretro_gui_stubs.cpp` and `libretro/libretro_stubs.cpp`.
+- Whenever a shared declaration gains a function or changes its signature, search the libretro stubs for the old contract and update them in the same change.
+- Do not solve missing symbols by adding host GUI sources to the libretro build; provide a no-op or headless implementation instead.
+- Run a clean standalone libretro build. Do not accept a permissive Linux shared-library link as proof that all symbols resolve; keep `-Wl,--no-undefined` enabled for normal builds. `SANITIZE=1` must omit it because Clang ASan shared libraries intentionally defer runtime symbols to the frontend.
 
 ### Phase 5: Report
 
@@ -251,6 +273,8 @@ To send a keypress, call `send_key` twice: once with state=1 (press), then state
 | `src/osdep/amiberry_input.cpp` | Input handling |
 | `src/osdep/amiberry.cpp` | Core platform layer |
 | `src/osdep/macos_bookmarks.h/.mm` | macOS security-scoped bookmarks (App Store) |
+| `libretro/libretro_gui_stubs.cpp` | Headless replacements for host GUI and overlay APIs |
+| `libretro/Makefile` | Standalone libretro source list and platform link rules |
 
 ## macOS Path Notes
 
@@ -268,6 +292,7 @@ To send a keypress, call `send_key` twice: once with state=1 (press), then state
 - If a fix touches input coordinates, explicitly note which coordinate space each variable is in
 - If a fix touches rendering quality, verify OSD, main frame, and external shader paths independently
 - If a fix touches RTG/P96 presentation, check guest pixel format metadata and host SDL surface format separately
+- If a fix changes shared OS-dependent APIs, update libretro stubs and run a clean standalone libretro build
 - For timing-sensitive bugs, use `runtime_set_config` to change CPU speed or floppy speed
 - For crashes, the signal name in `get_crash_info` tells you a lot: SIGSEGV = null pointer/bad memory, SIGABRT = assertion/abort, SIGBUS = alignment
 - Build with Debug type (`-DCMAKE_BUILD_TYPE=Debug`) for better crash info

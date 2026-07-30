@@ -1,4 +1,5 @@
 #include "sysdeps.h"
+#include "amiberry_rp9.h"
 #include "blkdev.h"
 #include "imgui.h"
 #include "options.h"
@@ -198,10 +199,17 @@ static void clear_play_content_if_quickstart_source() {
         play_clear_content_selection();
 }
 
+static void reset_rp9_to_quickstart_defaults() {
+    rp9_clear_loaded_path();
+    default_prefs(&changed_prefs, true, 0);
+    Quickstart_ApplyDefaults();
+    rp9_cleanup_unused();
+}
+
 void render_panel_quickstart() {
-    // Check if we need to apply Quickstart defaults on first show
+    // Apply defaults on first show only when no configuration or media setup is active.
     static bool initial_sync_done = false;
-    if (!initial_sync_done && !emulating && !last_loaded_config[0]) {
+    if (!initial_sync_done && !emulating && !last_loaded_config[0] && !last_active_config[0]) {
         Quickstart_ApplyDefaults();
         initial_sync_done = true;
     }
@@ -230,6 +238,7 @@ void render_panel_quickstart() {
     static int qs_pending_floppy_drive = -1;
     static bool qs_pending_cd = false;
     static bool qs_pending_whd = false;
+    static bool qs_pending_rp9 = false;
 
     bool df1_visible = true;
     bool cd_visible = false;
@@ -239,6 +248,9 @@ void render_panel_quickstart() {
     ImGui::Indent(4.0f);
 
     BeginGroupBox("Emulated Hardware");
+    const bool rp9_active = !rp9_get_loaded_path().empty();
+    if (rp9_active)
+        ImGui::BeginDisabled();
     if (ImGui::BeginTable("QuickstartModelTable", 2, ImGuiTableFlags_SizingStretchProp,
                           ImVec2(ImGui::GetContentRegionAvail().x - 15.0f, 0.0f))) {
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, BUTTON_WIDTH * 1.33f);
@@ -349,6 +361,10 @@ void render_panel_quickstart() {
 
         ImGui::EndTable();
     }
+    if (rp9_active)
+        ImGui::EndDisabled();
+    if (rp9_active)
+        ImGui::TextDisabled("Eject the RP9 package to change its hardware configuration.");
     EndGroupBox("Emulated Hardware");
 
     ImGui::Spacing();
@@ -526,8 +542,7 @@ void render_panel_quickstart() {
                             DISK_history_add(changed_prefs.floppyslots[i].df, -1, HISTORY_FLOPPY, 0);
                             disk_insert(i, changed_prefs.floppyslots[i].df);
                             qs_invalidate_wp_cache(i);
-                            if (!last_loaded_config[0])
-                                set_last_active_config(element.c_str());
+                            set_last_active_config_from_media(element.c_str());
                         }
                     }
                 }
@@ -646,8 +661,7 @@ void render_panel_quickstart() {
                                 DISK_history_add(changed_prefs.cdslots[0].name, -1, HISTORY_CD, 0);
                                 changed_prefs.cdslots[0].inuse = true;
                                 changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
-                                if (!last_loaded_config[0])
-                                    set_last_active_config(element.c_str());
+                                set_last_active_config_from_media(element.c_str());
                             }
                         }
                     }
@@ -717,7 +731,6 @@ void render_panel_quickstart() {
                         add_file_to_mru_list(lstMRUWhdloadList, whdload_prefs.whdload_filename);
                     }
                     whdload_auto_prefs(&changed_prefs, whdload_prefs.whdload_filename.c_str());
-                    set_last_active_config(whdload_prefs.whdload_filename.c_str());
                 }
             }
             if (is_selected) {
@@ -735,6 +748,29 @@ void render_panel_quickstart() {
 
     ImGui::Spacing();
 
+    BeginGroupBox("RP9 package:");
+    if (AmigaButton(ICON_FA_FOLDER_OPEN " Select file##QSRP9", ImVec2(BUTTON_WIDTH * 1.33f, 0))) {
+        const std::string initial_path = rp9_get_loaded_path().empty() ? get_rp9_path() : rp9_get_loaded_path();
+        OpenFileDialogKey("QUICKSTART", "Select RP9 package", ".rp9,.*", initial_path);
+        qs_pending_rp9 = true;
+    }
+
+    ImGui::SameLine();
+    if (AmigaButton(ICON_FA_EJECT "##QSRP9", ImVec2(SMALL_BUTTON_WIDTH, 0))) {
+        play_clear_content_selection();
+        if (!rp9_get_loaded_path().empty())
+            reset_rp9_to_quickstart_defaults();
+    }
+
+    ImGui::SameLine();
+    if (rp9_get_loaded_path().empty())
+        ImGui::TextUnformatted("<empty>");
+    else
+        ImGui::TextWrapped("%s", rp9_get_loaded_path().c_str());
+    EndGroupBox("RP9 package:");
+
+    ImGui::Spacing();
+
     BeginGroupBox("Mode");
     bool qs_mode = amiberry_options.quickstart_start;
     if (AmigaCheckbox("Start in Quickstart mode", &qs_mode))
@@ -744,13 +780,18 @@ void render_panel_quickstart() {
 
     ImGui::Spacing();
     if (AmigaButton(ICON_FA_CHECK " Set Configuration", ImVec2(BUTTON_WIDTH * 2, BUTTON_HEIGHT))) {
-        apply_quickstart_defaults_from_quickstart();
+        if (!rp9_get_loaded_path().empty())
+            reset_rp9_to_quickstart_defaults();
+        else
+            apply_quickstart_defaults_from_quickstart();
     }
 
     {
         std::string filePath;
         if (ConsumeFileDialogResultKey("QUICKSTART", filePath)) {
             play_clear_content_selection();
+            if (!qs_pending_rp9 && !filePath.empty() && !rp9_get_loaded_path().empty())
+                reset_rp9_to_quickstart_defaults();
             if (qs_pending_floppy_drive >= 0 && qs_pending_floppy_drive < 2) {
                 int i = qs_pending_floppy_drive;
                 if (!filePath.empty()) {
@@ -764,16 +805,14 @@ void render_panel_quickstart() {
                         disk_insert(i, changed_prefs.floppyslots[i].df);
                         add_file_to_mru_list(lstMRUDiskList, std::string(changed_prefs.dfxlist[0]));
                         qs_invalidate_wp_cache(i);
-                        if (!last_loaded_config[0])
-                            set_last_active_config(changed_prefs.dfxlist[0]);
+                        set_last_active_config_from_media(changed_prefs.dfxlist[0]);
                     } else if (std::strncmp(changed_prefs.floppyslots[i].df, filePath.c_str(), MAX_DPATH) != 0) {
                         std::strncpy(changed_prefs.floppyslots[i].df, filePath.c_str(), MAX_DPATH - 1);
                         changed_prefs.floppyslots[i].df[MAX_DPATH - 1] = '\0';
                         disk_insert(i, filePath.c_str());
                         add_file_to_mru_list(lstMRUDiskList, filePath);
                         qs_invalidate_wp_cache(i);
-                        if (!last_loaded_config[0])
-                            set_last_active_config(filePath.c_str());
+                        set_last_active_config_from_media(filePath.c_str());
                     }
                 }
             } else if (qs_pending_cd) {
@@ -783,8 +822,7 @@ void render_panel_quickstart() {
                         changed_prefs.cdslots[0].inuse = true;
                         changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
                         add_file_to_mru_list(lstMRUCDList, filePath);
-                        if (!last_loaded_config[0])
-                            set_last_active_config(filePath.c_str());
+                        set_last_active_config_from_media(filePath.c_str());
                     }
                 }
             } else if (qs_pending_whd) {
@@ -792,13 +830,28 @@ void render_panel_quickstart() {
                     whdload_prefs.whdload_filename = filePath;
                     add_file_to_mru_list(lstMRUWhdloadList, whdload_prefs.whdload_filename);
                     whdload_auto_prefs(&changed_prefs, whdload_prefs.whdload_filename.c_str());
-                    set_last_active_config(whdload_prefs.whdload_filename.c_str());
+                }
+            } else if (qs_pending_rp9) {
+                if (!filePath.empty()) {
+                    if (rp9_parse_file(&changed_prefs, filePath.c_str())) {
+                        for (int drive = 0; drive < changed_prefs.nr_floppies && drive < 4; ++drive) {
+                            if (changed_prefs.floppyslots[drive].df[0]) {
+                                disk_insert(drive, changed_prefs.floppyslots[drive].df);
+                                add_file_to_mru_list(lstMRUDiskList, changed_prefs.floppyslots[drive].df);
+                            }
+                        }
+                        if (changed_prefs.cdslots[0].inuse && changed_prefs.cdslots[0].name[0])
+                            add_file_to_mru_list(lstMRUCDList, changed_prefs.cdslots[0].name);
+                        set_last_active_config(filePath.c_str());
+                    } else {
+                        ShowMessageBox("Load RP9", rp9_get_last_error().c_str());
+                    }
                 }
             }
-
             qs_pending_floppy_drive = -1;
             qs_pending_cd = false;
             qs_pending_whd = false;
+            qs_pending_rp9 = false;
         }
     }
     ImGui::Unindent(5.0f);

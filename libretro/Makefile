@@ -48,6 +48,13 @@ ifeq ($(ARCH),)
    ARCH = $(shell uname -m)
 endif
 
+# Clang leaves ASan runtime references unresolved in shared libraries so the
+# frontend executable can provide the runtime. Keep strict symbol checking for
+# normal builds, but do not make sanitizer builds reject those references.
+ifneq ($(SANITIZE), 1)
+   NO_UNDEFINED := -Wl,--no-undefined
+endif
+
 ifeq ($(platform), unix)
    TARGET := $(TARGET_NAME)_libretro.so
    fpic := -fPIC
@@ -57,9 +64,9 @@ ifeq ($(platform), unix)
    CHD_PTTY := $(AMIBERRY_DIR)/src/archivers/chd/posixptty.cpp
    CHD_SOCKET := $(AMIBERRY_DIR)/src/archivers/chd/posixsocket.cpp
    ifeq ($(DEBUG), 1)
-   SHARED := -shared -Wl,-Bsymbolic-functions
+   SHARED := -shared $(NO_UNDEFINED) -Wl,-Bsymbolic-functions
    else
-   SHARED := -shared -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,-Bsymbolic-functions
+   SHARED := -shared $(NO_UNDEFINED) -Wl,--version-script=$(LIBRETRO_DIR)/link.T -Wl,-Bsymbolic-functions
    endif
 else ifeq ($(platform), osx)
    TARGET := $(TARGET_NAME)_libretro.dylib
@@ -270,6 +277,7 @@ SOURCES_CORE := $(AMIBERRY_DIR)/src/a2065.cpp \
                $(AMIBERRY_DIR)/src/softfloat/softfloat_decimal.cpp \
                $(AMIBERRY_DIR)/src/softfloat/softfloat_fpsp.cpp \
                $(AMIBERRY_DIR)/src/framebufferboards.cpp \
+               $(AMIBERRY_DIR)/src/zz9000.cpp \
                $(AMIBERRY_DIR)/src/fsdb.cpp \
                $(AMIBERRY_DIR)/src/fsusage.cpp \
                $(AMIBERRY_DIR)/src/gayle.cpp \
@@ -345,6 +353,8 @@ SOURCES_OSDEP := $(LIBRETRO_DIR)/libretro.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_uaenet.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_hardfile.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_whdbooter.cpp \
+                $(AMIBERRY_DIR)/src/osdep/amiberry_rp9.cpp \
+                $(AMIBERRY_DIR)/src/osdep/rp9_manifest.cpp \
                 $(AMIBERRY_DIR)/src/osdep/amiberry_filesys.cpp \
                 $(AMIBERRY_DIR)/src/osdep/cda_play.cpp \
                 $(AMIBERRY_DIR)/src/osdep/charset.cpp \

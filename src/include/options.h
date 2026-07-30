@@ -263,9 +263,7 @@ enum { CP_GENERIC = 1, CP_CDTV, CP_CDTVCR, CP_CD32, CP_A500, CP_A500P, CP_A600,
 #define IDE_A600A1200 1
 #define IDE_A4000 2
 
-#define GFX_WINDOW 0
-#define GFX_FULLSCREEN 1
-#define GFX_FULLWINDOW 2
+#include "amiberry_gfx_mode.h"
 
 #define AUTOSCALE_NONE 0
 #define AUTOSCALE_STATIC_AUTO 1
@@ -1106,6 +1104,7 @@ struct uae_prefs {
 
 #ifdef AMIBERRY
 	bool vkbd_enabled;
+	bool vkbd_numpad;
 	bool vkbd_hires;
 	bool vkbd_exit;
 	char vkbd_language[256];
@@ -1173,6 +1172,24 @@ extern void copy_prefs(const struct uae_prefs* src, struct uae_prefs* dst);
 extern void copy_inputdevice_prefs(const struct uae_prefs *src, struct uae_prefs *dst);
 
 #ifdef AMIBERRY
+// Distinguish the CD32-specific 3.1 image from the generic 310 RP9 code.
+constexpr int RP9_SYSTEM_ROM_310_CD32 = 31032;
+
+enum class rp9_system_model
+{
+	a1000,
+	a500,
+	a500plus,
+	a600,
+	a1200,
+	a2000,
+	a3000,
+	a4000,
+	cdtv,
+	cd32
+};
+
+extern int configure_rp9_system_rom(struct uae_prefs* p, rp9_system_model model, int rom);
 extern int bip_a500(struct uae_prefs* p, int rom);
 extern int bip_a500plus(struct uae_prefs* p, int rom);
 extern int bip_a600(struct uae_prefs* p, int rom);
@@ -1360,6 +1377,14 @@ struct amiberry_gui_theme
 	amiberry_gui_color foreground_color;
 };
 
+struct amiberry_shader_parameter
+{
+	bool rtg = false;
+	std::string shader;
+	std::string name;
+	float value = 0.0f;
+};
+
 struct amiberry_options
 {
 	bool quickstart_start = true;
@@ -1425,6 +1450,7 @@ struct amiberry_options
 	char gui_theme[128] = "Default.theme";
 	char shader[128] = "none";
 	char shader_rtg[128] = "none";
+	std::vector<amiberry_shader_parameter> shader_parameters;
 	bool use_bezel = false;
 	bool use_custom_bezel = false;
 	char custom_bezel[256] = "none";

@@ -31,6 +31,7 @@
 #include "xwin.h"
 #include "inputdevice.h"
 #include "amiberry_cursor.h"
+#include "amiberry_input_helpers.h"
 #ifdef SERIAL_PORT
 #include "serial.h"
 #endif
@@ -120,6 +121,7 @@ static int draw_line_next_line, draw_line_wclks;
 static uae_u32 rga_denise_cycle_line = 1;
 static struct pipeline_reg preg;
 static struct pipeline_func pfunc[MAX_PIPELINE_REG];
+static int pfunc_active_count;
 static uae_u16 prev_strobe;
 static bool vb_fast;
 static uae_u32 custom_state_flags;
@@ -134,6 +136,7 @@ static uae_u32 scandoubled_bpl_ptr[MAX_SCANDOUBLED_LINES + 1][2][MAX_PLANES];
 static int scandoubled_bpl_ptr_active[MAX_SCANDOUBLED_LINES + 1][2];
 
 static evt_t blitter_dma_change_cycle, copper_dma_change_cycle, sprite_dma_change_cycle_on, sprite_dma_change_cycle_off;
+static bool copper_dma_change_cycle_pending;
 
 static void empty_pipeline(void)
 {
@@ -163,6 +166,7 @@ static void pipelined_custom_write(evfunc2 func, uae_u16 v, uae_u16 cck)
 			p->func = func;
 			p->v = v;
 			p->cck = cck;
+			pfunc_active_count++;
 			return;
 		}
 	}
@@ -170,6 +174,9 @@ static void pipelined_custom_write(evfunc2 func, uae_u16 v, uae_u16 cck)
 }
 static void handle_pipelined_custom_write(bool now)
 {
+	if (!pfunc_active_count) {
+		return;
+	}
 	for (int i = 0 ; i < MAX_PIPELINE_REG; i++) {
 		struct pipeline_func *p = &pfunc[i];
 		if (p->func) {
@@ -177,6 +184,7 @@ static void handle_pipelined_custom_write(bool now)
 			if (!p->cck || now) {
 				auto f = p->func;
 				p->func = NULL;
+				pfunc_active_count--;
 				f(p->v);
 			}
 		}
@@ -222,7 +230,7 @@ static void write_drga_dat_spr_wide(uae_u16 rga, uaecptr pt, uae_u64 v)
 	r->line = rga_denise_cycle_line;
 };
 
-static void write_drga_dat_bpl16(uae_u16 rga, uaecptr pt, uae_u16 v, int plane)
+static void write_drga_dat_bpl16(uae_u16 rga, uaecptr pt, uae_u16 v)
 {
 	struct denise_rga *r = &rga_denise[rga_denise_cycle];
 	r->rga = rga;
@@ -231,16 +239,7 @@ static void write_drga_dat_bpl16(uae_u16 rga, uaecptr pt, uae_u16 v, int plane)
 	r->flags = 0;
 	r->line = rga_denise_cycle_line;
 };
-static void write_drga_dat_bpl32(uae_u16 rga, uaecptr pt, uae_u32 v, int plane)
-{
-	struct denise_rga *r = &rga_denise[rga_denise_cycle];
-	r->rga = rga;
-	r->v = v;
-	r->pt = pt;
-	r->flags = 0;
-	r->line = rga_denise_cycle_line;
-};
-static void write_drga_dat_bpl64(uae_u16 rga, uaecptr pt, uae_u64 v, int plane)
+static void write_drga_dat_bpl64(uae_u16 rga, uaecptr pt, uae_u64 v)
 {
 	struct denise_rga *r = &rga_denise[rga_denise_cycle];
 	r->rga = rga;
@@ -692,7 +691,7 @@ struct sprite {
 
 static struct sprite spr[MAX_SPRITES];
 uaecptr sprite_0;
-int sprite_0_width, sprite_0_height, sprite_0_doubled;
+int sprite_0_width, sprite_0_height, sprite_0_doubled, sprite_0_x, sprite_0_y;
 uae_u32 sprite_0_colors[4];
 uae_u32 magic_sprite_mask = 0xffffffff;
 
@@ -2863,8 +2862,11 @@ static bool is_blitter_dma(void)
 static bool is_copper_dma(bool checksame)
 {
 	bool dma = dmaen(DMA_COPPER);
-	if (checksame && get_cycles() <= copper_dma_change_cycle) {
-		return dma == false;
+	if (checksame && copper_dma_change_cycle_pending) {
+		if (get_cycles() <= copper_dma_change_cycle) {
+			return dma == false;
+		}
+		copper_dma_change_cycle_pending = false;
 	}
 	return dma;
 }
@@ -3017,6 +3019,7 @@ static void DMACON(int hpos, uae_u16 v)
 	}
 	if (newcop && !oldcop) {
 		if (safecpu()) {
+			copper_dma_change_cycle_pending = true;
 			if (copper_access) {
 				copper_dma_change_cycle = get_cycles();
 			} else {
@@ -3026,6 +3029,7 @@ static void DMACON(int hpos, uae_u16 v)
 		copper_enabled_thisline = 1;
 	} else if (!newcop && oldcop) {
 		if (safecpu()) {
+			copper_dma_change_cycle_pending = true;
 			if (copper_access) {
 				copper_dma_change_cycle = get_cycles();
 			} else {
@@ -4240,11 +4244,11 @@ static int get_reg_chip(int reg)
 		return 1 | 2;
 	} else if (reg >= 0x140 && reg < 0x140 + 8 * 8) {
 		if (reg & 4) {
-			return 2 + 4;
+			return 2 | 0x20; // SPRxDATx
 		}
-		return 1 | 2;
+		return 1 | 2; // SPRxPOS/SPRxCTL
 	} else if (reg >= 0x110 && reg < 0x110 + 8 * 2) {
-		return 2;
+		return 2 | 0x10;
 	} else if (reg == 0x02c) {
 		if (currprefs.cpu_memory_cycle_exact) {
 			return 1 | 2;
@@ -4258,6 +4262,39 @@ static int get_reg_chip(int reg)
 		return 2;
 	}
 	return 1;
+}
+
+static uae_u64 wordto64convert(int fm, uae_u16 value)
+{
+	uae_u16 noise = regs.chipset_latch_rw;
+	uae_u64 v;
+
+	if (fm == 0) {
+		v = ((uae_u64)value << 48) | ((uae_u64)0 << 32) | ((uae_u64)value << 16) | (uae_u64)0;
+	} else if (fm == 1) {
+		v = ((uae_u64)value << 48) | ((uae_u64)value << 32) | ((uae_u64)value << 16) | (uae_u64)value;
+	} else if (fm == 2) {
+		v = ((uae_u64)noise << 48) | ((uae_u64)value << 32) | ((uae_u64)value << 16) | (uae_u64)value;
+	} else {
+		v = ((uae_u64)noise << 48) | ((uae_u64)value << 32) | ((uae_u64)value << 16) | (uae_u64)value;
+	}
+	return v;
+}
+
+static void custom_wput_dma64(int reg, uaecptr pt, uae_u32 value, int c)
+{
+	uae_u16 noise = regs.chipset_latch_rw;
+	if (c & 0x10) {
+		// BPL
+		uae_u64 v = wordto64convert(fetchmode_fmode_bpl, value);
+		write_drga_dat_bpl64(reg, pt, v);
+	} else if (c & 0x20) {
+		// SPR
+		uae_u64 v = wordto64convert(fetchmode_fmode_spr, value);
+		write_drga_dat_spr_wide(reg, pt, v);
+	} else {
+		write_drga(reg, pt, value);
+	}
 }
 
 static void custom_wput_pipelined(uaecptr pt, uae_u16 v)
@@ -4275,14 +4312,14 @@ static void custom_wput_copper(uaecptr pt, uaecptr addr, uae_u32 value, int noge
 	int reg = addr & 0x1fe;
 	int c = get_reg_chip(reg);
 	if (c & 1) {
-		//custom_wput_pipelined(addr, value);
 		custom_wput_1(addr, value, 1 | 0x8000);
 	}
 	if (c & 2) {
-		if (c & 4) {
-			value <<= 16;
+		if (aga_mode) {
+			custom_wput_dma64(reg, pt, value, c);
+		} else {
+			write_drga(reg, pt, value);
 		}
-		write_drga(reg, pt, value);
 	}
 	copper_access = 0;
 }
@@ -4403,6 +4440,10 @@ static void cursorsprite(struct sprite *s)
 		return;
 	}
 	sprite_0 = s->pt;
+#ifdef AMIBERRY
+	sprite_0_x = amiberry_input_native_sprite_x(s->pos, s->ctl, aga_mode || ecs_denise);
+	sprite_0_y = amiberry_input_native_sprite_y(s->pos, s->ctl, ecs_agnus);
+#endif
 	sprite_0_height = s->vstop - s->vstart;
 	sprite_0_colors[0] = 0;
 	sprite_0_doubled = 0;
@@ -4410,9 +4451,11 @@ static void cursorsprite(struct sprite *s)
 	if (sprres == 0) {
 		sprite_0_doubled = 1;
 	}
-	if (spr[0].dblscan) {
-		sprite_0_height /= 2;
-	}
+	// SPRxPOS bit 7 only enables alternate-line sprite DMA when FMODE.SSCAN2
+	// is active. Without that gate it is also an ordinary vertical position
+	// bit, and halving here squashes the host cursor as it crosses line 128.
+	sprite_0_height = amiberry_input_native_cursor_height(sprite_0_height,
+		spr[0].dblscan, (fmode & 0x8000) != 0);
 	if (aga_mode) {
 		int sbasecol = ((bplcon4 >> 4) & 15) << 4;
 		sprite_0_colors[1] = agnus_colors.color_regs_aga[sbasecol + 1] & 0xffffff;
@@ -4426,7 +4469,7 @@ static void cursorsprite(struct sprite *s)
 	sprite_0_width = sprite_width;
 	if (amiberry_cursor_host_only_enabled(currprefs.input_tablet,
 		currprefs.input_magic_mouse_cursor, MAGICMOUSE_HOST_ONLY,
-		isfullscreen() <= 0) && mousehack_alive()) {
+		isfullscreen() == 0) && mousehack_alive()) {
 		magic_sprite_mask &= ~SPRITE_RENDER_MASK(0);
 	} else {
 		magic_sprite_mask |= SPRITE_RENDER_MASK(0);
@@ -4895,6 +4938,7 @@ static void vsync_handler_render(void)
 #endif
 
 #ifdef PICASSO96
+	picasso_update_native_cursor(0);
 	if (isvsync_rtg() >= 0) {
 		rtg_vsync();
 	}
@@ -6629,6 +6673,7 @@ void custom_reset(bool hardreset, bool keyboardreset)
 		struct pipeline_func *p = &pfunc[i];
 		memset(p, 0, sizeof(struct pipeline_func));
 	}
+	pfunc_active_count = 0;
 	rga_denise_cycle = 0;
 	rga_denise_cycle_start = 0;
 	rga_denise_cycle_count_end = 0;
@@ -6638,6 +6683,7 @@ void custom_reset(bool hardreset, bool keyboardreset)
 
 	vsync_startline = 3;
 	copper_dma_change_cycle = 0;
+	copper_dma_change_cycle_pending = true;
 	blitter_dma_change_cycle = 0;
 	sprite_dma_change_cycle_on = 0;
 
@@ -7618,9 +7664,6 @@ static int REGPARAM2 custom_wput_1(uaecptr addr, uae_u32 value, int noget)
 	}
 	if (!(noget & 0x8000) && (c & 2)) {
 		uae_u32 v = value;
-		if (c & 4) {
-			v <<= 16;
-		}
 		if (!currprefs.cpu_memory_cycle_exact || custom_fastmode > 0) {
 			// fast CPU RGA pipeline, allow multiple register writes per CCK
 			if (!denise_update_reg_queued(addr, v, rga_denise_cycle_line)) {
@@ -7628,7 +7671,12 @@ static int REGPARAM2 custom_wput_1(uaecptr addr, uae_u32 value, int noget)
 				denise_update_reg_queue(addr, value, rga_denise_cycle_line);
 			}
 		} else {
-			write_drga(addr, 0, v);
+			int reg = addr & 0x1fe;
+			if (aga_mode) {
+				custom_wput_dma64(reg, NULL, v, c);
+			} else {
+				write_drga(reg, NULL, v);
+			}
 		}
 	}
 	return ret;
@@ -9136,11 +9184,10 @@ static struct rgabuf *alloc_copper_cycle_dummy(void)
 
 static void generate_copper(void)
 {
-	bool bus_allocated = !check_rga_free_slot_in();
 	bool dma = is_copper_dma(true);
-	bool enable = !bus_allocated && dma;
-	bool ena_odd = (agnus_hpos & 1) == COPPER_CYCLE_POLARITY && enable;
-	bool act_even = (agnus_hpos & 1) != COPPER_CYCLE_POLARITY && dma;
+	bool odd_cycle = (agnus_hpos & 1) == COPPER_CYCLE_POLARITY;
+	bool ena_odd = odd_cycle && dma && check_rga_free_slot_in();
+	bool act_even = !odd_cycle && dma;
 	bool idle = !cop_state.irload1 && !cop_state.irload2 && !cop_state.start;
 	struct rgabuf *rga = NULL;
 
@@ -9236,7 +9283,7 @@ static void generate_copper(void)
 	// causing it to do DMA from address 0.
 	// I assume it happens because there is very short even->odd transition in
 	// horizontal counter bit 0 before new even value is loaded.
-	if (enable && !(agnus_hpos & 1) && !(agnus_hpos_prev & 1)) {
+	if (!odd_cycle && !(agnus_hpos_prev & 1) && dma && check_rga_free_slot_in()) {
 		if (!rga) {
 			if (cop_state.irload1 == 1 || cop_state.start == 1 ||
 				(cop_state.irload2 == 1 && cop_state.validmove && !cop_state.irload1)) {
@@ -11801,12 +11848,21 @@ static void handle_rga_out(void)
 				debug_getpeekdma_chipram(*r->p, MW_MASK_SPR_0 + num, r->reg);
 			}
 #endif
-			if (fetchmode_fmode_spr == 0) {
+			if (!aga_mode) {
+				uae_u16 dat = fetch16(r);
+				sdat = dat;
+				if (!dmastate) {
+					write_drga_dat_spr(r->reg, pt, sdat);
+				} else {
+					write_drga_dat_spr(r->reg, pt, dat);
+				}
+			} else if (fetchmode_fmode_spr == 0) {
 				uae_u16 dat = fetch16(r);
 				if (!dmastate) {
 					write_drga_dat_spr(r->reg, pt, dat);
 				} else {
-					write_drga_dat_spr(r->reg, pt, dat << 16);
+					uae_u64 v = wordto64convert(fetchmode_fmode_spr, dat);
+					write_drga_dat_spr_wide(r->reg, pt, v);
 				}
 				sdat = dat;
 			} else if (fetchmode_fmode_spr < 3) {
@@ -11815,7 +11871,7 @@ static void handle_rga_out(void)
 				if (!dmastate) {
 					write_drga_dat_spr(r->reg, pt, sdat);
 				} else {
-					write_drga_dat_spr(r->reg, pt, dat);
+					write_drga_dat_spr_wide(r->reg, pt, ((uae_u64)dat << 32) | (uae_u64)dat);
 				}
 			} else {
 				uae_u64 dat = fetch64(r);
@@ -11866,20 +11922,21 @@ static void handle_rga_out(void)
 #endif
 			if (!aga_mode) {
 				uae_u32 dat = fetch16(r);
-				write_drga_dat_bpl16(r->reg, pt, dat, num);
+				write_drga_dat_bpl16(r->reg, pt, dat);
 				regs.chipset_latch_rw = (uae_u16)dat;
 			} else {
 				if (fetchmode_fmode_bpl == 0) {
-					uae_u32 dat = fetch16(r);
-					write_drga_dat_bpl16(r->reg, pt, dat, num);
-					regs.chipset_latch_rw = (uae_u16)dat;
+					uae_u16 dat = fetch16(r);
+					uae_u64 v = wordto64convert(fetchmode_fmode_bpl, dat);
+					write_drga_dat_bpl64(r->reg, pt, v);
+					regs.chipset_latch_rw = dat;
 				} else if (fetchmode_fmode_bpl < 3) {
 					uae_u32 dat = fetch32_bpl(r);
-					write_drga_dat_bpl32(r->reg, pt, dat, num);
+					write_drga_dat_bpl64(r->reg, pt, ((uae_u64)dat << 32) | (uae_u64)dat);
 					regs.chipset_latch_rw = (uae_u16)dat;
 				} else {
 					uae_u64 dat64 = fetch64(r);
-					write_drga_dat_bpl64(r->reg, pt, dat64, num);
+					write_drga_dat_bpl64(r->reg, pt, dat64);
 					regs.chipset_latch_rw = (uae_u16)dat64;
 				}
 			}

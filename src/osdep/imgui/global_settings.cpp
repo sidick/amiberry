@@ -12,6 +12,7 @@
 #include "registry.h"
 #include "target.h"
 #include "gui/gui_handling.h"
+#include "shader_catalog.h"
 
 namespace {
 
@@ -84,6 +85,44 @@ static bool render_string_row(const char* label, char* value, const size_t value
 	return changed;
 }
 
+static bool render_hotkey_row(const char* label, char* value, const size_t value_size, const char* help)
+{
+	next_setting_row(label);
+	const bool changed = HotkeyPicker("##value", value, value_size);
+	finish_setting_row(help);
+	return changed;
+}
+
+static bool render_input_device_row(const char* label, char* value, const size_t value_size,
+	const char* help)
+{
+	next_setting_row(label);
+	const auto& options = get_input_device_options();
+	int current_index = -1;
+	for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+		if ((!value[0] && options[i].id == JPORT_NONE)
+			|| stricmp(options[i].config_value.c_str(), value) == 0) {
+			current_index = i;
+			break;
+		}
+	}
+
+	const char* preview = value[0] ? value : "<none>";
+	if (current_index >= 0)
+		preview = options[current_index].label.c_str();
+
+	ImGui::SetNextItemWidth(-1.0f);
+	int selected_index = current_index;
+	const bool changed = InputDeviceCombo("##value", current_index, preview, &selected_index);
+	if (changed) {
+		const char* config_value = options[selected_index].config_value.c_str();
+		strncpy(value, config_value, value_size - 1);
+		value[value_size - 1] = '\0';
+	}
+	finish_setting_row(help);
+	return changed;
+}
+
 static bool render_string_combo_row(const char* label, char* value, const size_t value_size,
 	const StringComboOption* options, const int option_count, const char* help)
 {
@@ -113,6 +152,126 @@ static bool render_string_combo_row(const char* label, char* value, const size_t
 		ImGui::EndCombo();
 	}
 	AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActive());
+	finish_setting_row(help);
+	return changed;
+}
+
+static bool render_shader_combo_row(const char* label, char* value, const size_t value_size,
+	const bool rtg, const char* help)
+{
+	next_setting_row(label);
+	const auto& shader_names = get_available_shader_names();
+	const char* preview = value[0] ? value : "none";
+
+	bool changed = false;
+#ifdef USE_OPENGL
+	const float parameters_button_width = BUTTON_WIDTH * 1.75f;
+	ImGui::SetNextItemWidth(std::max(BUTTON_WIDTH,
+		ImGui::GetContentRegionAvail().x - parameters_button_width - ImGui::GetStyle().ItemSpacing.x));
+#else
+	ImGui::SetNextItemWidth(-1.0f);
+#endif
+	if (ImGui::BeginCombo("##value", preview)) {
+		for (const auto& shader_name : shader_names) {
+			const bool selected = strcmp(shader_name.c_str(), value) == 0;
+			if (ImGui::Selectable(shader_name.c_str(), selected)) {
+				strncpy(value, shader_name.c_str(), value_size - 1);
+				value[value_size - 1] = '\0';
+				changed = true;
+			}
+			if (selected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+	AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActive());
+#ifdef USE_OPENGL
+	ImGui::SameLine();
+	if (AmigaButton(ICON_FA_SLIDERS " Shader Parameters...",
+		ImVec2(parameters_button_width, BUTTON_HEIGHT))) {
+		ShaderParameters_Open(value, rtg);
+	}
+#endif
+	finish_setting_row(help);
+	return changed;
+}
+
+static bool render_catalog_combo_row(const char* label, char* value, const size_t value_size,
+	const std::vector<std::string>& options, const char* help)
+{
+	next_setting_row(label);
+	const char* preview = value[0] ? value : (options.empty() ? "none" : options.front().c_str());
+
+	bool changed = false;
+	ImGui::SetNextItemWidth(-1.0f);
+	if (ImGui::BeginCombo("##value", preview)) {
+		for (const auto& option : options) {
+			const bool selected = stricmp(option.c_str(), value) == 0;
+			if (ImGui::Selectable(option.c_str(), selected)) {
+				strncpy(value, option.c_str(), value_size - 1);
+				value[value_size - 1] = '\0';
+				changed = true;
+			}
+			if (selected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+	AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActive());
+	finish_setting_row(help);
+	return changed;
+}
+
+static bool render_sound_device_row(const char* label, int* value, const char* help)
+{
+	next_setting_row(label);
+	const auto& device_names = get_sound_device_names();
+	const char* preview = "System default";
+	if (*value > 0 && *value < static_cast<int>(device_names.size()))
+		preview = device_names[*value].c_str();
+	else if (*value > 0)
+		preview = "Unknown device";
+
+	bool changed = false;
+	ImGui::SetNextItemWidth(-1.0f);
+	if (ImGui::BeginCombo("##value", preview)) {
+		if (ImGui::Selectable("System default", *value == 0)) {
+			*value = 0;
+			changed = true;
+		}
+		if (*value == 0)
+			ImGui::SetItemDefaultFocus();
+
+		// Index zero is represented by the system-default choice in amiberry.conf.
+		for (int i = 1; i < static_cast<int>(device_names.size()); ++i) {
+			const bool selected = *value == i;
+			if (ImGui::Selectable(device_names[i].c_str(), selected)) {
+				*value = i;
+				changed = true;
+			}
+			if (selected)
+				ImGui::SetItemDefaultFocus();
+		}
+		ImGui::EndCombo();
+	}
+	AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActive());
+	finish_setting_row(help);
+	return changed;
+}
+
+static bool render_sound_buffer_row(const char* label, int* value, const char* help)
+{
+	next_setting_row(label);
+	int buffer_index = get_sound_buffer_size_index(*value);
+	const float value_width = BUTTON_WIDTH * 1.6f;
+	ImGui::SetNextItemWidth(std::max(BUTTON_WIDTH, ImGui::GetContentRegionAvail().x - value_width));
+	const bool changed = ImGui::SliderInt("##value", &buffer_index, 0,
+		IM_ARRAYSIZE(SOUND_BUFFER_SIZES), "");
+	AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), false);
+	if (changed)
+		*value = buffer_index == 0 ? 0 : SOUND_BUFFER_SIZES[buffer_index - 1];
+	ImGui::SameLine();
+	ImGui::TextUnformatted(buffer_index == 0 ? "Min" : std::to_string(*value).c_str());
 	finish_setting_row(help);
 	return changed;
 }
@@ -258,7 +417,6 @@ void render_panel_global_settings()
 	};
 	static const ComboOption fullscreen_options[] = {
 		{0, "Windowed"},
-		{1, "Fullscreen"},
 		{2, "Full-window"},
 	};
 	static const ComboOption enabled_options[] = {
@@ -276,6 +434,26 @@ void render_panel_global_settings()
 		{3, "Low compatibility"},
 		{4, "Low compatibility (JIT)"},
 	};
+	static const ComboOption stereo_separation_options[] = {
+		{10, "100%"},
+		{9, "90%"},
+		{8, "80%"},
+		{7, "70%"},
+		{6, "60%"},
+		{5, "50%"},
+		{4, "40%"},
+		{3, "30%"},
+		{2, "20%"},
+		{1, "10%"},
+		{0, "0%"},
+	};
+	static const ComboOption sound_frequency_options[] = {
+		{11025, "11025"},
+		{22050, "22050"},
+		{32000, "32000"},
+		{44100, "44100"},
+		{48000, "48000"},
+	};
 	static const StringComboOption vkbd_language_options[] = {
 		{"US", "US"},
 		{"UK", "UK"},
@@ -286,8 +464,9 @@ void render_panel_global_settings()
 	render_group("Startup and GUI", "GlobalStartupGui", [&]() {
 		render_bool_row("Quickstart on startup", &amiberry_options.quickstart_start,
 			"Open the Quickstart panel by default when the GUI starts without a loaded configuration.");
-		render_bool_row("Read config descriptions", &amiberry_options.read_config_descriptions,
-			"Read descriptions from configuration files while building the Configurations panel list.");
+		render_bool_row("Read config metadata", &amiberry_options.read_config_descriptions,
+			"Read descriptions and categories while building the Configurations list. "
+			"This enables richer display and grouping, but opens each .uae file and can be slower for large libraries.");
 		render_bool_row("GUI joystick control", &amiberry_options.gui_joystick_control,
 			"Allow joystick/gamepad navigation in the GUI.");
 		render_bool_row("Disable shutdown button", &amiberry_options.disable_shutdown_button,
@@ -305,42 +484,45 @@ void render_panel_global_settings()
 		render_bool_row("Keyboard joystick stops keypresses",
 			&amiberry_options.input_keyboard_as_joystick_stop_keypresses,
 			"Stop keyboard-as-joystick mappings from also generating normal Amiga key presses.");
-		render_int_row("Joystick deadzone", &amiberry_options.default_joystick_deadzone,
-			"Default joystick and joystick-mouse deadzone percentage.", 1, 0, 100);
-		render_string_row("Open GUI key", amiberry_options.default_open_gui_key,
+		next_setting_row("Joystick deadzone");
+		ImGui::SetNextItemWidth(-1.0f);
+		ImGui::SliderInt("##value", &amiberry_options.default_joystick_deadzone, 0, 100, "%d%%");
+		AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), false);
+		finish_setting_row("Default joystick and joystick-mouse deadzone percentage.");
+		render_hotkey_row("Open GUI key", amiberry_options.default_open_gui_key,
 			sizeof amiberry_options.default_open_gui_key,
 			"Default keyboard shortcut for opening the GUI.");
-		render_string_row("Quit key", amiberry_options.default_quit_key,
+		render_hotkey_row("Quit key", amiberry_options.default_quit_key,
 			sizeof amiberry_options.default_quit_key,
 			"Default keyboard shortcut for quitting Amiberry.");
-		render_string_row("Action Replay key", amiberry_options.default_ar_key,
+		render_hotkey_row("Action Replay key", amiberry_options.default_ar_key,
 			sizeof amiberry_options.default_ar_key,
 			"Default keyboard shortcut for activating Action Replay/HRTmon.");
-		render_string_row("Fullscreen toggle key", amiberry_options.default_fullscreen_toggle_key,
+		render_hotkey_row("Full-window toggle key", amiberry_options.default_fullscreen_toggle_key,
 			sizeof amiberry_options.default_fullscreen_toggle_key,
-			"Default keyboard shortcut for toggling fullscreen mode.");
+			"Default keyboard shortcut for toggling Windowed and Full-window modes.");
 		render_bool_row("RetroArch quit", &amiberry_options.default_retroarch_quit,
 			"Enable RetroArch-style quit button mapping by default when a mapping exists.");
 		render_bool_row("RetroArch menu", &amiberry_options.default_retroarch_menu,
 			"Enable RetroArch-style menu button mapping by default when a mapping exists.");
 		render_bool_row("RetroArch reset", &amiberry_options.default_retroarch_reset,
 			"Enable RetroArch-style reset button mapping by default when a mapping exists.");
-		render_string_row("Controller 1", amiberry_options.default_controller1,
+		render_input_device_row("Controller 1", amiberry_options.default_controller1,
 			sizeof amiberry_options.default_controller1,
-			"Default controller mapping for port 1, such as joy1.");
-		render_string_row("Controller 2", amiberry_options.default_controller2,
+			"Default controller mapping for port 1.");
+		render_input_device_row("Controller 2", amiberry_options.default_controller2,
 			sizeof amiberry_options.default_controller2,
-			"Default controller mapping for port 2, such as joy2.");
-		render_string_row("Controller 3", amiberry_options.default_controller3,
+			"Default controller mapping for port 2.");
+		render_input_device_row("Controller 3", amiberry_options.default_controller3,
 			sizeof amiberry_options.default_controller3,
 			"Default controller mapping for port 3.");
-		render_string_row("Controller 4", amiberry_options.default_controller4,
+		render_input_device_row("Controller 4", amiberry_options.default_controller4,
 			sizeof amiberry_options.default_controller4,
 			"Default controller mapping for port 4.");
-		render_string_row("Mouse 1", amiberry_options.default_mouse1,
+		render_input_device_row("Mouse 1", amiberry_options.default_mouse1,
 			sizeof amiberry_options.default_mouse1,
 			"Default mouse mapping for mouse port 1.");
-		render_string_row("Mouse 2", amiberry_options.default_mouse2,
+		render_input_device_row("Mouse 2", amiberry_options.default_mouse2,
 			sizeof amiberry_options.default_mouse2,
 			"Default mouse mapping for mouse port 2.");
 	});
@@ -369,20 +551,24 @@ void render_panel_global_settings()
 			"Default native display window width.", 1, 1, 16384);
 		render_int_row("Default height", &amiberry_options.default_height,
 			"Default native display window height.", 1, 1, 16384);
-		render_combo_row("Fullscreen mode", &amiberry_options.default_fullscreen_mode,
+		amiberry_options.default_fullscreen_mode = amiberry_normalize_gfx_fullscreen_mode(
+			amiberry_options.default_fullscreen_mode);
+		render_combo_row("Screen mode", &amiberry_options.default_fullscreen_mode,
 			fullscreen_options, IM_ARRAYSIZE(fullscreen_options),
 			"Default native and RTG screen mode.");
 	});
 
 	render_group("Sound defaults", "GlobalSoundDefaults", [&]() {
-		render_int_row("Stereo separation", &amiberry_options.default_stereo_separation,
-			"Default stereo separation, from 0 to 10.", 1, 0, 10);
-		render_int_row("Sound frequency", &amiberry_options.default_sound_frequency,
-			"Default audio output frequency. Values above 48000 are ignored by startup defaults.", 1000, 1, 192000);
-		render_int_row("Sound buffer", &amiberry_options.default_sound_buffer,
-			"Default sound buffer size in bytes.", 256, 1, 65536);
-		render_int_row("Sound card", &amiberry_options.default_soundcard,
-			"Default sound device index. 0 means the system default device.", 1, 0, INT_MAX);
+		render_combo_row("Stereo separation", &amiberry_options.default_stereo_separation,
+			stereo_separation_options, IM_ARRAYSIZE(stereo_separation_options),
+			"Default stereo separation between the left and right channels.");
+		render_combo_row("Sound frequency", &amiberry_options.default_sound_frequency,
+			sound_frequency_options, IM_ARRAYSIZE(sound_frequency_options),
+			"Default audio output sample rate in Hz.");
+		render_sound_buffer_row("Sound buffer", &amiberry_options.default_sound_buffer,
+			"Default emulator audio buffer size. Smaller values reduce latency but may cause glitches on slower systems.");
+		render_sound_device_row("Audio device", &amiberry_options.default_soundcard,
+			"Default sound output device. Index zero uses the operating system default.");
 	});
 
 	render_group("WHDLoad defaults", "GlobalWHDLoadDefaults", [&]() {
@@ -420,22 +606,34 @@ void render_panel_global_settings()
 	});
 
 	render_group("Visual defaults", "GlobalVisualDefaults", [&]() {
-		render_string_row("GUI theme", amiberry_options.gui_theme,
-			sizeof amiberry_options.gui_theme,
+		render_catalog_combo_row("GUI theme", amiberry_options.gui_theme,
+			sizeof amiberry_options.gui_theme, get_available_theme_names(),
 			"Theme file loaded by the ImGui interface.");
-		render_string_row("Native shader", amiberry_options.shader,
-			sizeof amiberry_options.shader,
+		render_shader_combo_row("Native shader", amiberry_options.shader,
+			sizeof amiberry_options.shader, false,
 			"Default shader preset for native chipset modes. Use none to disable.");
-		render_string_row("RTG shader", amiberry_options.shader_rtg,
-			sizeof amiberry_options.shader_rtg,
+		render_shader_combo_row("RTG shader", amiberry_options.shader_rtg,
+			sizeof amiberry_options.shader_rtg, true,
 			"Default shader preset for RTG modes. Use none to disable.");
-		render_bool_row("Use bezel", &amiberry_options.use_bezel,
-			"Show the default CRT bezel overlay.");
-		render_bool_row("Use custom bezel", &amiberry_options.use_custom_bezel,
-			"Use the custom bezel path below instead of the default bezel.");
-		render_string_row("Custom bezel", amiberry_options.custom_bezel,
-			sizeof amiberry_options.custom_bezel,
-			"Custom bezel image path or none.");
+		const bool custom_bezel_active = amiberry_options.use_custom_bezel
+			&& stricmp(amiberry_options.custom_bezel, "none") != 0;
+		if (custom_bezel_active)
+			amiberry_options.use_bezel = false;
+		ImGui::BeginDisabled(custom_bezel_active);
+		if (render_bool_row("Use bezel", &amiberry_options.use_bezel,
+			"Show the built-in CRT bezel overlay.") && amiberry_options.use_bezel)
+			amiberry_options.use_custom_bezel = false;
+		ImGui::EndDisabled();
+
+		ImGui::BeginDisabled(amiberry_options.use_bezel);
+		if (render_catalog_combo_row("Custom bezel", amiberry_options.custom_bezel,
+			sizeof amiberry_options.custom_bezel, get_available_bezel_names(),
+			"Select a custom bezel overlay from the Bezels directory, or none to disable it.")) {
+			amiberry_options.use_custom_bezel = stricmp(amiberry_options.custom_bezel, "none") != 0;
+			if (amiberry_options.use_custom_bezel)
+				amiberry_options.use_bezel = false;
+		}
+		ImGui::EndDisabled();
 	});
 
 	render_group("Paths and logging", "GlobalPathsLogging", [&]() {
@@ -550,4 +748,7 @@ void render_panel_global_settings()
 			"Swap host End and Page Up before they reach the Amiga. Saved in amiberry.ini."))
 			key_swap_end_pgup = swap_end_pageup ? 1 : 0;
 	});
+
+	HotkeyCapture_RenderPopup();
+	ShaderParameters_RenderPopup();
 }

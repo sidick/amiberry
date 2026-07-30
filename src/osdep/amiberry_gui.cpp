@@ -611,7 +611,7 @@ void ReadConfigFileList()
 		{
 			auto p = cfgfile_open(tmp->FullPath, nullptr);
 			if (p) {
-				cfgfile_get_description(p, nullptr, tmp->Description, nullptr, nullptr, nullptr, nullptr, nullptr);
+				cfgfile_get_description(p, nullptr, tmp->Description, tmp->Category, nullptr, nullptr, nullptr, nullptr);
 				cfgfile_close(p);
 			}
 		}
@@ -647,6 +647,7 @@ void disk_selection(const int shortcut, uae_prefs* prefs)
 				strncpy(prefs->floppyslots[shortcut].df, tmp.c_str(), MAX_DPATH);
 				disk_insert(shortcut, tmp.c_str());
 				add_file_to_mru_list(lstMRUDiskList, tmp);
+				set_last_active_config_from_media(tmp.c_str());
 			}
 		}
 	}
@@ -720,6 +721,7 @@ void disk_selection(const int shortcut, uae_prefs* prefs)
 				changed_prefs.cdslots[0].inuse = true;
 				changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
 				add_file_to_mru_list(lstMRUCDList, tmp);
+				set_last_active_config_from_media(tmp.c_str());
 			}
 		}
 	}
@@ -1031,8 +1033,10 @@ static void gui_flicker_led2(int led, int unitnum, int status)
 void gui_flicker_led(int led, int unitnum, int status)
 {
 	if (led < 0) {
-		gui_flicker_led2(LED_HD, 0, 0);
-		gui_flicker_led2(LED_CD, 0, 0);
+		if (gui_data.hd >= 0)
+			gui_flicker_led2(LED_HD, 0, 0);
+		if (gui_data.cd >= 0)
+			gui_flicker_led2(LED_CD, 0, 0);
 		if (gui_data.net >= 0)
 			gui_flicker_led2(LED_NET, 0, 0);
 		if (gui_data.md >= 0)
@@ -1939,7 +1943,7 @@ std::string get_system_fonts_path()
 	return path;
 }
 
-void save_theme(const std::string& theme_filename)
+bool save_theme(const std::string& theme_filename)
 {
 	std::string filename = get_themes_path();
 	filename.append(theme_filename);
@@ -1968,7 +1972,9 @@ void save_theme(const std::string& theme_filename)
 		write_color("background_color", gui_theme.background_color);
 		write_color("foreground_color", gui_theme.foreground_color);
 		file_output.close();
+		return !file_output.fail();
 	}
+	return false;
 }
 
 void load_theme(const std::string& theme_filename)

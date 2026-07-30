@@ -10,6 +10,8 @@
 void render_panel_display() {
     ImGui::Indent(4.0f);
 
+    const bool kmsdrm = kmsdrm_detected;
+
     // Logic Check: RTG Enabled
     // WinUAE: ((!address_space_24 || configtype==2) && size) || type >= HARDWARE
     bool rtg_enabled = false;
@@ -73,7 +75,15 @@ void render_panel_display() {
     // ---------------------------------------------------------
     BeginGroupBox("Screen Settings");
 
+    if (kmsdrm) {
+        ImGui::TextDisabled("KMSDRM uses the active console display mode");
+        ImGui::SameLine();
+        ShowHelpMarker("Host resolution and refresh rate are controlled by the console configuration. Amiberry uses console Full-window mode; blocking OpenGL/GLES with matching console and emulated refresh uses hardware/vblank pacing, otherwise software timing is used.");
+        ImGui::Spacing();
+    }
+
     // Windowed & Buffering
+    if (kmsdrm) ImGui::BeginDisabled();
     ImGui::AlignTextToFramePadding();
     ImGui::Text("Windowed:");
     ImGui::SameLine(BUTTON_WIDTH);
@@ -95,21 +105,30 @@ void render_panel_display() {
     AmigaCheckbox("Borderless", &changed_prefs.borderless);
     ShowHelpMarker("Remove window decorations (title bar and borders) while in windowed mode");
     if (!is_windowed) ImGui::EndDisabled();
+    if (kmsdrm) ImGui::EndDisabled();
 
     ImGui::Spacing();
 
     ImGui::AlignTextToFramePadding();
     ImGui::Text("Native:");
     ImGui::SameLine(BUTTON_WIDTH);
-    const char *screenmode_items[] = {"Windowed", "Fullscreen", "Full-window"};
+    changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen = amiberry_normalize_gfx_fullscreen_mode(
+        changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen);
+    changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen = amiberry_normalize_gfx_fullscreen_mode(
+        changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen);
+    const char *screenmode_items[] = {"Windowed", "Full-window"};
+    const int screenmode_values[] = {GFX_WINDOW, GFX_FULLWINDOW};
     ImGui::SetNextItemWidth(BUTTON_WIDTH * 1.5f);
-    if (ImGui::BeginCombo("##NativeMode", screenmode_items[changed_prefs.gfx_apmode[0].gfx_fullscreen])) {
+    if (kmsdrm) ImGui::BeginDisabled();
+    const char *native_mode_label = kmsdrm || changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen == GFX_FULLWINDOW
+        ? "Full-window" : "Windowed";
+    if (ImGui::BeginCombo("##NativeMode", native_mode_label)) {
         for (int n = 0; n < IM_ARRAYSIZE(screenmode_items); n++) {
-            const bool is_selected = (changed_prefs.gfx_apmode[0].gfx_fullscreen == n);
+            const bool is_selected = changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen == screenmode_values[n];
             if (is_selected)
                 ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
             if (ImGui::Selectable(screenmode_items[n], is_selected)) {
-                changed_prefs.gfx_apmode[0].gfx_fullscreen = n;
+                changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen = screenmode_values[n];
             }
             if (is_selected) {
                 ImGui::PopStyleColor();
@@ -118,8 +137,11 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
+    if (kmsdrm) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("Native chipset screen mode: Windowed, Fullscreen or Full-window (borderless fullscreen)");
+    ShowHelpMarker(kmsdrm
+        ? "KMSDRM always uses the active console display in Full-window mode"
+        : "Native chipset screen mode: Windowed or Full-window (borderless desktop mode)");
 
     ImGui::SameLine();
 
@@ -140,7 +162,8 @@ void render_panel_display() {
         vsync_idx = 2;
 
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 5.0f);
-    if (ImGui::BeginCombo("##NativeVSync", vsync_items[vsync_idx])) {
+    if (kmsdrm) ImGui::BeginDisabled();
+    if (ImGui::BeginCombo("##NativeVSync", kmsdrm ? "KMSDRM" : vsync_items[vsync_idx])) {
         for (int n = 0; n < IM_ARRAYSIZE(vsync_items); n++) {
             const bool is_selected = (vsync_idx == n);
             if (is_selected)
@@ -173,8 +196,11 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
+    if (kmsdrm) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("VSync mode: Standard waits for vertical blank, 50/60Hz enforces refresh rate, Adaptive uses VRR (FreeSync/G-SYNC) with late-swap tearing fallback");
+    ShowHelpMarker(kmsdrm
+        ? "Legacy KMSDRM uses software timing with drained presentation; blocking presentation is used for pacing only when console and emulated refresh match. VSync controls, refresh switching, and Adaptive/VRR modes are not available"
+        : "VSync mode: Standard waits for vertical blank, 50/60Hz enforces refresh rate, Adaptive uses VRR (FreeSync/G-SYNC) with late-swap tearing fallback");
 
     ImGui::Spacing();
 
@@ -183,13 +209,16 @@ void render_panel_display() {
     ImGui::Text("RTG:");
     ImGui::SameLine(BUTTON_WIDTH);
     ImGui::SetNextItemWidth(BUTTON_WIDTH * 1.5f);
-    if (ImGui::BeginCombo("##RTGMode", screenmode_items[changed_prefs.gfx_apmode[1].gfx_fullscreen])) {
+    if (kmsdrm) ImGui::BeginDisabled();
+    const char *rtg_mode_label = kmsdrm || changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen == GFX_FULLWINDOW
+        ? "Full-window" : "Windowed";
+    if (ImGui::BeginCombo("##RTGMode", rtg_mode_label)) {
         for (int n = 0; n < IM_ARRAYSIZE(screenmode_items); n++) {
-            const bool is_selected = (changed_prefs.gfx_apmode[1].gfx_fullscreen == n);
+            const bool is_selected = changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen == screenmode_values[n];
             if (is_selected)
                 ImGui::PushStyleColor(ImGuiCol_Header, ImGui::GetStyle().Colors[ImGuiCol_HeaderActive]);
             if (ImGui::Selectable(screenmode_items[n], is_selected)) {
-                changed_prefs.gfx_apmode[1].gfx_fullscreen = n;
+                changed_prefs.gfx_apmode[APMODE_RTG].gfx_fullscreen = screenmode_values[n];
             }
             if (is_selected) {
                 ImGui::PopStyleColor();
@@ -198,8 +227,11 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
+    if (kmsdrm) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("RTG (Picasso96) screen mode when using graphics card emulation");
+    ShowHelpMarker(kmsdrm
+        ? "KMSDRM always uses the active console display in Full-window mode"
+        : "RTG (Picasso96) screen mode when using graphics card emulation");
 
     ImGui::SameLine();
 
@@ -211,7 +243,8 @@ void render_panel_display() {
         changed_prefs.gfx_apmode[1].gfx_vsyncmode = 0;
     }
     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 5.0f);
-    if (ImGui::BeginCombo("##RTGVSync", vsync_rtg_items[rtg_vsync_idx])) {
+    if (kmsdrm) ImGui::BeginDisabled();
+    if (ImGui::BeginCombo("##RTGVSync", kmsdrm ? "KMSDRM" : vsync_rtg_items[rtg_vsync_idx])) {
         for (int n = 0; n < IM_ARRAYSIZE(vsync_rtg_items); n++) {
             const bool is_selected = (rtg_vsync_idx == n);
             if (is_selected)
@@ -232,16 +265,19 @@ void render_panel_display() {
         }
         ImGui::EndCombo();
     }
+    if (kmsdrm) ImGui::EndDisabled();
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("VSync mode for RTG display");
+    ShowHelpMarker(kmsdrm
+        ? "KMSDRM presentation timing depends on the SDL driver path; RTG remains software-paced"
+        : "VSync mode for RTG display");
     if (!rtg_enabled) ImGui::EndDisabled();
 
     ImGui::Spacing();
 
     // Checkboxes
-    if (ImGui::BeginTable("ChkTable", 2, ImGuiTableFlags_None)) {
-        ImGui::TableSetupColumn("column1", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("column2", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    if (ImGui::BeginTable("ChkTable", 2, ImGuiTableFlags_SizingFixedFit)) {
+        ImGui::TableSetupColumn("column1", ImGuiTableColumnFlags_WidthFixed);
+        ImGui::TableSetupColumn("column2", ImGuiTableColumnFlags_WidthFixed);
 
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
@@ -278,7 +314,7 @@ void render_panel_display() {
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::AlignTextToFramePadding();
-        ImGui::Text("Resolution:");
+        ImGui::Text("Amiga resolution:");
         ImGui::SameLine();
         const char *resolution_items[] = {"LowRes", "HighRes (normal)", "SuperHighRes"};
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 5.0f);
@@ -299,7 +335,7 @@ void render_panel_display() {
             ImGui::EndCombo();
         }
         AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-        ShowHelpMarker("Horizontal resolution: LowRes (320px), HighRes (640px), or SuperHighRes (1280px). Disabled when resolution autoswitch is enabled");
+        ShowHelpMarker("Emulated Amiga horizontal resolution: LowRes (320px), HighRes (640px), or SuperHighRes (1280px). This does not change the host display mode. Disabled when resolution autoswitch is enabled");
         if (!resolution_enabled) ImGui::EndDisabled();
 
         ImGui::TableNextColumn();
@@ -370,16 +406,19 @@ void render_panel_display() {
         ImGui::EndCombo();
     }
     AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), ImGui::IsItemActivated());
-    ShowHelpMarker("Automatically switch resolution based on Amiga display mode. Percentage values control sensitivity threshold");
+    ShowHelpMarker("Automatically adjust Amiberry's internal render resolution and line mode to match the Amiga screen. "
+        "This does not change the host display resolution or refresh rate. Always On follows the highest resolution "
+        "present in each frame. Percentage values require the dominant resolution to cover at least that share of "
+        "the frame; lower percentages switch more readily.");
 
     ImGui::Spacing();
 
     // Refresh Slider + PAL/NTSC
     // WinUAE: Label "Refresh:" -> Slider -> Dropdown "PAL"
-    if (ImGui::BeginTable("RefreshRowTable", 3, ImGuiTableFlags_None)) {
+    if (ImGui::BeginTable("RefreshRowTable", 3, ImGuiTableFlags_SizingFixedFit)) {
         ImGui::TableSetupColumn("label", ImGuiTableColumnFlags_WidthFixed, BUTTON_WIDTH * 0.7f);
-        ImGui::TableSetupColumn("slider", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("combo", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("slider", ImGuiTableColumnFlags_WidthFixed, BUTTON_WIDTH);
+        ImGui::TableSetupColumn("combo", ImGuiTableColumnFlags_WidthFixed, BUTTON_WIDTH);
 
         ImGui::TableNextRow();
         ImGui::TableNextColumn();

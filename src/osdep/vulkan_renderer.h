@@ -162,12 +162,18 @@ private:
 
 		// Crop + scaling state snapshot
 		SDL_Rect crop{};
+		int crop_display_width = 0;
+		int crop_display_height = 0;
 		bool integer_scaling = false;
 		bool picasso_on = false;
 		bool screen_is_picasso = false;
 		int scalepicasso = 0;
 		int rtg_integer_scale_limit = 0;
 		float desired_aspect = 4.0f / 3.0f;
+		bool correct_native_aspect = false;
+		bool exclusive_fullscreen = false;
+		int desktop_width = 0;
+		int desktop_height = 0;
 
 		// Zero-copy RTG path
 		bool zerocopy = false;

@@ -272,6 +272,99 @@ bool ShaderPreset::load_from_file(const char* preset_path_cstr)
 	return true;
 }
 
+bool ShaderPreset::load_parameter_metadata_from_file(const char* preset_path,
+	std::vector<ShaderParameter>& parameters, std::string* error_message)
+{
+	parameters.clear();
+	if (!preset_path) {
+		if (error_message)
+			*error_message = "No shader preset selected";
+		return false;
+	}
+
+	ShaderPreset parser;
+	std::map<std::string, std::string> values;
+	if (!parser.parse_preset_file(preset_path, values)) {
+		if (error_message)
+			*error_message = parser.error_message_;
+		return false;
+	}
+
+	const auto shader_count = values.find("shaders");
+	if (shader_count == values.end()) {
+		if (error_message)
+			*error_message = "No 'shaders' key found in preset";
+		return false;
+	}
+
+	int pass_count = 0;
+	try {
+		pass_count = std::stoi(shader_count->second);
+	}
+	catch (...) {
+		if (error_message)
+			*error_message = "Invalid shader pass count: " + shader_count->second;
+		return false;
+	}
+	if (pass_count < 1 || pass_count > 26) {
+		if (error_message)
+			*error_message = "Invalid shader pass count: " + std::to_string(pass_count);
+		return false;
+	}
+
+	namespace fs = std::filesystem;
+	const std::string base_dir = fs::path(preset_path).parent_path().string();
+	for (int i = 0; i < pass_count; ++i) {
+		const auto shader = values.find("shader" + std::to_string(i));
+		if (shader == values.end()) {
+			if (error_message)
+				*error_message = "Missing shader" + std::to_string(i) + " in preset";
+			return false;
+		}
+
+		std::vector<ShaderParameter> pass_parameters;
+		std::string pass_error;
+		const std::string shader_path = parser.resolve_path(shader->second, base_dir);
+		if (!ExternalShader::load_parameter_metadata_from_file(
+			shader_path.c_str(), pass_parameters, &pass_error)) {
+			if (error_message)
+				*error_message = std::move(pass_error);
+			return false;
+		}
+		parameters.insert(parameters.end(), pass_parameters.begin(), pass_parameters.end());
+	}
+
+	const auto parameter_names = values.find("parameters");
+	if (parameter_names != values.end()) {
+		std::stringstream names(parameter_names->second);
+		std::string name;
+		while (std::getline(names, name, ';')) {
+			name = trim(name);
+			const auto value = values.find(name);
+			if (name.empty() || value == values.end())
+				continue;
+
+			try {
+				const float current_value = std::stof(value->second);
+				for (auto& parameter : parameters) {
+					if (parameter.name == name) {
+						parameter.current_value = std::max(parameter.min_value,
+							std::min(parameter.max_value, current_value));
+						break;
+					}
+				}
+			}
+			catch (...) {
+				if (error_message)
+					*error_message = "Invalid value for shader parameter " + name + ": " + value->second;
+				return false;
+			}
+		}
+	}
+
+	return true;
+}
+
 bool ShaderPreset::build_from_values(const std::map<std::string, std::string>& values, const std::string& base_dir)
 {
 	// Get pass count
@@ -969,7 +1062,7 @@ void ShaderPreset::bind_pass_uniforms(int pass_index, int input_w, int input_h,
 
 void ShaderPreset::render(const unsigned char* pixels, int width, int height, int pitch,
 	int viewport_x, int viewport_y, int viewport_w, int viewport_h,
-	int frame_count)
+	int frame_count, const GLuint target_framebuffer)
 {
 	if (!valid_ || passes_.empty()) return;
 	if (!pixels) return;
@@ -1071,7 +1164,7 @@ void ShaderPreset::render(const unsigned char* pixels, int width, int height, in
 
 		// Bind render target
 		if (is_last) {
-			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glBindFramebuffer(GL_FRAMEBUFFER, target_framebuffer);
 			glViewport(viewport_x, viewport_y, viewport_w, viewport_h);
 			glDisable(GL_FRAMEBUFFER_SRGB);
 		} else {

@@ -119,6 +119,8 @@ struct AmigaMonitor {
 	bool ratio_sizing;
 	bool render_ok, wait_render;
 	int dpi;
+	int desktop_width = 0;
+	int desktop_height = 0;
 
 	int in_sizemove;
 	bool focus_transitioning;
@@ -233,3 +235,4 @@ extern bool no_wm_detected;
 // can retry. Override via AMIBERRY_NO_WM env var ("1"/"0") on non-KMSDRM
 // platforms; KMSDRM is never overridable.
 void detect_no_wm();
+bool get_kmsdrm_drawable_size(SDL_Window* window, int* width, int* height);

@@ -6,6 +6,7 @@
  * Copyright 2001 Bernd Schmidt
  */
 #include <cstdarg>
+#include <cerrno>
 #include <cstdio>
 #include <iostream>
 #include <clocale>
@@ -51,6 +52,7 @@ static int bootlogmode;
 
 FILE* debugfile = nullptr;
 int console_logging = 0;
+// Process-local because console availability depends on how Amiberry was launched.
 static int debugger_type = -1;
 BOOL debuggerinitializing = false;
 extern bool lof_store;
@@ -319,9 +321,7 @@ static void openconsole ()
 {
 #if defined(AMIBERRY_MACOS) || (!defined(__ANDROID__) && !defined(AMIBERRY_IOS))
 	if (debugger_type < 0) {
-		regqueryint(NULL, _T("DebuggerType"), &debugger_type);
-		if (debugger_type <= 0)
-			debugger_type = console_debugger_available() ? 1 : 2;
+		debugger_type = console_debugger_available() ? 1 : 2;
 	}
 	if (debugger_type == 1 && !console_debugger_available()) {
 		debugger_type = 2;
@@ -362,9 +362,7 @@ static void openconsole ()
 		if (consoleopen > 0 || debuggerinitializing)
 			return;
 		if (debugger_type < 0) {
-			regqueryint (NULL, _T("DebuggerType"), &debugger_type);
-			if (debugger_type <= 0)
-				debugger_type = 1;
+			debugger_type = 1;
 			openconsole();
 			return;
 		}
@@ -401,7 +399,6 @@ void debugger_change (int mode)
 #endif
 	if (debugger_type != 1 && debugger_type != 2)
 		debugger_type = 2;
-	regsetint (NULL, _T("DebuggerType"), debugger_type);
 	openconsole ();
 }
 
@@ -779,6 +776,51 @@ int console_get (TCHAR *out, int maxlen)
 		return debugger_window_get(out, maxlen);
 #endif
 	set_console_input_mode(1);
+#ifdef AMIBERRY
+	if (debugger_external_control_available()) {
+		while (debugger_active) {
+			if (debugger_poll_external_control())
+				return -2;
+
+#ifdef _WIN32
+			const HANDLE stdinput = GetStdHandle(STD_INPUT_HANDLE);
+			const DWORD wait_result = stdinput == INVALID_HANDLE_VALUE
+				? WAIT_FAILED : WaitForSingleObject(stdinput, 50);
+			if (wait_result != WAIT_OBJECT_0) {
+				Sleep(10);
+				continue;
+			}
+#else
+			struct pollfd pfd{};
+			pfd.fd = STDIN_FILENO;
+			pfd.events = POLLIN;
+			int result;
+			do {
+				result = poll(&pfd, 1, 50);
+			} while (result < 0 && errno == EINTR);
+			if (result <= 0 || !(pfd.revents & POLLIN)) {
+				if (result > 0 && (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+					SDL_Delay(10);
+				continue;
+			}
+#endif
+
+			TCHAR *res = fgets(out, maxlen, stdin);
+			if (res == nullptr) {
+				clearerr(stdin);
+				SDL_Delay(10);
+				continue;
+			}
+			int len = strlen(out);
+			while (len > 0 && (out[len - 1] == '\r' || out[len - 1] == '\n')) {
+				out[len - 1] = 0;
+				len--;
+			}
+			return len;
+		}
+		return -1;
+	}
+#endif
 	TCHAR *res = fgets(out, maxlen, stdin);
 	if (res == nullptr) {
 		return -1;

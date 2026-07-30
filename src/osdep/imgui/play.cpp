@@ -9,6 +9,8 @@
 
 #include "file_dialog.h"
 #include "filesys.h"
+#include "amiberry_gfx.h"
+#include "amiberry_rp9.h"
 #include "gui/gui_handling.h"
 #include "imgui_panels.h"
 #include "custom.h"
@@ -93,6 +95,8 @@ const char* suggested_profile_text(const PlayContentType type, const PlaySuggest
 {
 	if (type == PlayContentType::Configuration)
 		return "Configuration file settings";
+	if (type == PlayContentType::Rp9)
+		return "Machine and media settings from the RP9 manifest";
 	if (type == PlayContentType::WhdLoad)
 		return "WHDLoad autoload; the database/slave can adjust the exact machine";
 	if (model == PlaySuggestedModel::A1200Expanded)
@@ -119,8 +123,6 @@ void initialize_display_defaults()
 
 	switch (changed_prefs.gfx_apmode[APMODE_NATIVE].gfx_fullscreen) {
 	case GFX_FULLSCREEN:
-		display_defaults.screen_mode = PlayScreenMode::Fullscreen;
-		break;
 	case GFX_FULLWINDOW:
 		display_defaults.screen_mode = PlayScreenMode::FullWindow;
 		break;
@@ -402,6 +404,8 @@ std::string current_attachment_path_for_type(const PlayContentType type)
 		return changed_prefs.floppyslots[0].df;
 	case PlayContentType::WhdLoad:
 		return whdload_prefs.whdload_filename;
+	case PlayContentType::Rp9:
+		return rp9_get_loaded_path();
 	case PlayContentType::Cd:
 		return changed_prefs.cdslots[0].inuse ? changed_prefs.cdslots[0].name : "";
 	case PlayContentType::Hardfile:
@@ -428,6 +432,8 @@ PlayContentType selected_action_type()
 void mark_content_applied()
 {
 	applied_content_type = selected_action_type();
+	if (applied_content_type != PlayContentType::Rp9)
+		rp9_clear_loaded_path();
 	applied_content_attachment_path = current_attachment_path_for_type(applied_content_type);
 	applied_config_summary = describe_current_config();
 	selected_content_applied = true;
@@ -508,6 +514,42 @@ bool apply_configuration_content()
 	return true;
 }
 
+bool apply_rp9_content()
+{
+	if (!rp9_parse_file(&changed_prefs, selected_content.original_path.c_str())) {
+		ShowMessageBox("Load RP9", rp9_get_last_error().c_str());
+		return false;
+	}
+
+	const bool has_clip = rp9_loaded_has_clip();
+	const bool manual_crop = changed_prefs.gfx_manual_crop;
+	const int crop_width = changed_prefs.gfx_manual_crop_width;
+	const int crop_height = changed_prefs.gfx_manual_crop_height;
+	const int crop_x = changed_prefs.gfx_horizontal_offset;
+	const int crop_y = changed_prefs.gfx_vertical_offset;
+	apply_display_defaults_to_changed_prefs();
+	if (has_clip) {
+		changed_prefs.gfx_auto_crop = false;
+		changed_prefs.gfx_manual_crop = manual_crop;
+		changed_prefs.gfx_manual_crop_width = crop_width;
+		changed_prefs.gfx_manual_crop_height = crop_height;
+		changed_prefs.gfx_horizontal_offset = crop_x;
+		changed_prefs.gfx_vertical_offset = crop_y;
+	}
+
+	for (int drive = 0; drive < changed_prefs.nr_floppies && drive < 4; ++drive) {
+		if (changed_prefs.floppyslots[drive].df[0]) {
+			disk_insert(drive, changed_prefs.floppyslots[drive].df);
+			add_file_to_mru_list(lstMRUDiskList, changed_prefs.floppyslots[drive].df);
+		}
+	}
+	if (changed_prefs.cdslots[0].inuse && changed_prefs.cdslots[0].name[0])
+		add_file_to_mru_list(lstMRUCDList, changed_prefs.cdslots[0].name);
+	set_last_active_config(selected_content.original_path.c_str());
+	mark_content_applied();
+	return true;
+}
+
 bool apply_floppy_content()
 {
 	apply_quickstart_model_unless_overridden(suggested_model_for_action(PlayContentType::Floppy));
@@ -520,7 +562,7 @@ bool apply_floppy_content()
 			changed_prefs.dfxlist[0]);
 		disk_insert(0, changed_prefs.floppyslots[0].df);
 		add_file_to_mru_list(lstMRUDiskList, std::string(changed_prefs.dfxlist[0]));
-		set_last_active_config(changed_prefs.dfxlist[0]);
+		set_last_active_config_from_media(changed_prefs.dfxlist[0]);
 		mark_content_applied();
 		return true;
 	}
@@ -529,7 +571,7 @@ bool apply_floppy_content()
 		selected_content.original_path);
 	disk_insert(0, changed_prefs.floppyslots[0].df);
 	add_file_to_mru_list(lstMRUDiskList, selected_content.original_path);
-	set_last_active_config(selected_content.original_path.c_str());
+	set_last_active_config_from_media(selected_content.original_path.c_str());
 	mark_content_applied();
 	return true;
 }
@@ -542,7 +584,6 @@ bool apply_whdload_content()
 	add_file_to_mru_list(lstMRUWhdloadList, whdload_prefs.whdload_filename);
 	whdload_auto_prefs(&changed_prefs, whdload_prefs.whdload_filename.c_str(), manual_quickstart_override);
 	apply_display_defaults_to_changed_prefs();
-	set_last_active_config(whdload_prefs.whdload_filename.c_str());
 	mark_content_applied();
 	return true;
 }
@@ -554,7 +595,7 @@ bool apply_hardfile_content()
 	if (!attach_selected_hardfile())
 		return false;
 
-	set_last_active_config(selected_content.original_path.c_str());
+	set_last_active_config_from_media(selected_content.original_path.c_str());
 	mark_content_applied();
 	return true;
 }
@@ -564,6 +605,7 @@ void mount_selected_cd_image(const char* path)
 	copy_path_to_buffer(changed_prefs.cdslots[0].name, sizeof changed_prefs.cdslots[0].name, path);
 	changed_prefs.cdslots[0].inuse = true;
 	changed_prefs.cdslots[0].type = SCSI_UNIT_DEFAULT;
+	set_last_active_config_from_media(path);
 }
 
 bool apply_cd_content()
@@ -579,7 +621,6 @@ bool apply_cd_content()
 		cd_auto_prefs(&changed_prefs, path);
 	apply_display_defaults_to_changed_prefs();
 	add_file_to_mru_list(lstMRUCDList, selected_content.original_path);
-	set_last_active_config(selected_content.original_path.c_str());
 	mark_content_applied();
 	return true;
 }
@@ -589,6 +630,8 @@ bool apply_selected_content(const PlayContentType type)
 	switch (type) {
 	case PlayContentType::Configuration:
 		return apply_configuration_content();
+	case PlayContentType::Rp9:
+		return apply_rp9_content();
 	case PlayContentType::Floppy:
 		return apply_floppy_content();
 	case PlayContentType::WhdLoad:
@@ -722,15 +765,25 @@ void render_display_defaults()
 {
 	initialize_display_defaults();
 
-	static const char* screen_items[] = { "Windowed", "Full-window", "Fullscreen" };
+	static const char* screen_items[] = { "Windowed", "Full-window" };
 	static const char* scaling_items[] = { "Auto", "Integer", "Smooth" };
 	static const char* shader_items[] = { "None", "CRT", "1084", "Custom" };
 
+	if (kmsdrm_detected)
+		display_defaults.screen_mode = PlayScreenMode::FullWindow;
+
 	int screen_mode = static_cast<int>(display_defaults.screen_mode);
+	if (kmsdrm_detected)
+		ImGui::BeginDisabled();
 	if (render_combo("Screen mode:", &screen_mode, screen_items, IM_ARRAYSIZE(screen_items))) {
 		display_defaults.screen_mode = static_cast<PlayScreenMode>(screen_mode);
 		apply_display_defaults_to_changed_prefs();
 	}
+	if (kmsdrm_detected)
+		ImGui::EndDisabled();
+	ShowHelpMarker(kmsdrm_detected
+		? "KMSDRM always uses the active console display in Full-window mode."
+		: "Run the emulation in a desktop window or a borderless Full-window.");
 
 	int scaling = static_cast<int>(display_defaults.scaling);
 	if (render_combo("Scaling:", &scaling, scaling_items, IM_ARRAYSIZE(scaling_items))) {
@@ -752,6 +805,8 @@ void render_display_defaults()
 		display_defaults.shader = static_cast<PlayShaderChoice>(shader);
 		apply_display_defaults_to_changed_prefs();
 	}
+	ShowHelpMarker("This Play choice is applied after content auto-configuration, including WHDLoad. "
+		"Custom preserves the native and RTG shader names selected in Display or Global Settings.");
 
 	ImGui::Spacing();
 	if (AmigaButton("Apply now", ImVec2(BUTTON_WIDTH * 1.2f, BUTTON_HEIGHT)))
@@ -769,7 +824,7 @@ void render_content_picker()
 {
 	if (AmigaButton(ICON_FA_FOLDER_OPEN " Choose content...", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT))) {
 		OpenFileDialogKey("PLAY_CONTENT", "Choose Amiga content",
-			"Amiga Content (*.uae,*.adf,*.adz,*.dms,*.fdi,*.scp,*.wrp,*.dsq,*.ipf,*.zip,*.7z,*.lha,*.lzh,*.lzx,*.cue,*.bin,*.iso,*.ccd,*.mds,*.chd,*.nrg,*.hdf,*.hdz,*.hda,*.vhd,*.img,*.gz,*.xz){.uae,.adf,.adz,.dms,.fdi,.scp,.wrp,.dsq,.ipf,.zip,.7z,.lha,.lzh,.lzx,.cue,.bin,.iso,.ccd,.mds,.chd,.nrg,.hdf,.hdz,.hda,.vhd,.img,.gz,.xz},All Files (*){.*}",
+			"Amiga Content (*.uae,*.rp9,*.adf,*.adz,*.dms,*.fdi,*.scp,*.wrp,*.dsq,*.ipf,*.zip,*.7z,*.lha,*.lzh,*.lzx,*.cue,*.bin,*.iso,*.ccd,*.mds,*.chd,*.nrg,*.hdf,*.hdz,*.hda,*.vhd,*.img,*.gz,*.xz){.uae,.rp9,.adf,.adz,.dms,.fdi,.scp,.wrp,.dsq,.ipf,.zip,.7z,.lha,.lzh,.lzx,.cue,.bin,.iso,.ccd,.mds,.chd,.nrg,.hdf,.hdz,.hda,.vhd,.img,.gz,.xz},All Files (*){.*}",
 			get_floppy_path());
 	}
 	if (AmigaButton(ICON_FA_FOLDER_OPEN " Choose folder...", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT)))
@@ -819,10 +874,12 @@ void render_content_picker()
 					play_prepare_selected_content_for_start();
 				ImGui::SameLine();
 			}
-			if (AmigaButton(ICON_FA_ROCKET " Change model...", ImVec2(BUTTON_WIDTH * 1.8f, BUTTON_HEIGHT))) {
-				mark_selected_content_pending();
-				begin_quickstart_override_tracking();
-				gui_show_panel("quickstart", true);
+			if (action_type != PlayContentType::Rp9) {
+				if (AmigaButton(ICON_FA_ROCKET " Change model...", ImVec2(BUTTON_WIDTH * 1.8f, BUTTON_HEIGHT))) {
+					mark_selected_content_pending();
+					begin_quickstart_override_tracking();
+					gui_show_panel("quickstart", true);
+				}
 			}
 			if (action_type == PlayContentType::Hardfile) {
 				ImGui::SameLine();

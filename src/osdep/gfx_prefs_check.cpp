@@ -59,6 +59,14 @@ int check_prefs_changed_gfx()
 {
 	int c = 0;
 	bool monitors[MAX_AMIGAMONITORS]{};
+	const bool auto_crop_enabled = !currprefs.gfx_auto_crop && changed_prefs.gfx_auto_crop;
+
+	const bool native_code_changed = currprefs.native_code != changed_prefs.native_code;
+	if (native_code_changed) {
+		if (currprefs.native_code && !changed_prefs.native_code)
+			uaelib_host_cleanup();
+		currprefs.native_code = changed_prefs.native_code;
+	}
 
 	if (!config_changed && !display_change_requested)
 		return 0;
@@ -308,6 +316,9 @@ int check_prefs_changed_gfx()
 		currprefs.gfx_auto_crop = changed_prefs.gfx_auto_crop;
 		currprefs.gfx_manual_crop = changed_prefs.gfx_manual_crop;
 
+		if (auto_crop_enabled)
+			force_auto_crop = true;
+
 		if (currprefs.gfx_auto_crop)
 		{
 			changed_prefs.gfx_xcenter = changed_prefs.gfx_ycenter = 0;
@@ -535,7 +546,7 @@ int check_prefs_changed_gfx()
 		currprefs.minimized_pause != changed_prefs.minimized_pause ||
 		currprefs.minimized_input != changed_prefs.minimized_input ||
 		currprefs.capture_always != changed_prefs.capture_always ||
-		currprefs.native_code != changed_prefs.native_code ||
+		native_code_changed ||
 		currprefs.alt_tab_release != changed_prefs.alt_tab_release ||
 		currprefs.ctrl_alt_release != changed_prefs.ctrl_alt_release ||
 		currprefs.use_retroarch_quit != changed_prefs.use_retroarch_quit ||
@@ -569,7 +580,6 @@ int check_prefs_changed_gfx()
 		currprefs.minimized_pause = changed_prefs.minimized_pause;
 		currprefs.minimized_input = changed_prefs.minimized_input;
 		currprefs.capture_always = changed_prefs.capture_always;
-		currprefs.native_code = changed_prefs.native_code;
 		currprefs.alt_tab_release = changed_prefs.alt_tab_release;
 		currprefs.ctrl_alt_release = changed_prefs.ctrl_alt_release;
 		currprefs.use_retroarch_quit = changed_prefs.use_retroarch_quit;
@@ -657,11 +667,13 @@ int check_prefs_changed_gfx()
 #ifdef AMIBERRY
 	// On-screen keyboard
 	if (currprefs.vkbd_enabled != changed_prefs.vkbd_enabled ||
+		currprefs.vkbd_numpad != changed_prefs.vkbd_numpad ||
 		currprefs.vkbd_transparency != changed_prefs.vkbd_transparency ||
 		_tcscmp(currprefs.vkbd_language, changed_prefs.vkbd_language) ||
 		_tcscmp(currprefs.vkbd_toggle, changed_prefs.vkbd_toggle))
 	{
 		currprefs.vkbd_enabled = changed_prefs.vkbd_enabled;
+		currprefs.vkbd_numpad = changed_prefs.vkbd_numpad;
 		currprefs.vkbd_transparency = changed_prefs.vkbd_transparency;
 		_tcscpy(currprefs.vkbd_language, changed_prefs.vkbd_language);
 		_tcscpy(currprefs.vkbd_toggle, changed_prefs.vkbd_toggle);
@@ -673,6 +685,7 @@ int check_prefs_changed_gfx()
 				: 0.85f;
 			imgui_osk_set_transparency(alpha);
 			imgui_osk_set_language(currprefs.vkbd_language);
+			imgui_osk_set_numpad(currprefs.vkbd_numpad);
 			vkbd_key = get_hotkey_from_config(string(currprefs.vkbd_toggle));
 			vkbd_button = SDL_GetGamepadButtonFromString(currprefs.vkbd_toggle);
 			imgui_osk_init();

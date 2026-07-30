@@ -18,6 +18,7 @@
 
 #include "sdl_renderer.h"
 #include "amiberry_gfx.h"
+#include "amiberry_gfx_geometry.h"
 #include "display_modes.h"
 #include "gfx_platform_internal.h"
 #include "imgui_overlay.h"
@@ -32,12 +33,6 @@ extern SDL_Surface* amiga_surface;
 SDLRenderer* get_sdl_renderer()
 {
 	return dynamic_cast<SDLRenderer*>(g_renderer.get());
-}
-
-static bool is_kmsdrm_video_driver()
-{
-	const char* driver = SDL_GetCurrentVideoDriver();
-	return driver != nullptr && strcmpi(driver, "KMSDRM") == 0;
 }
 
 // --- Context lifecycle ---
@@ -64,7 +59,7 @@ bool SDLRenderer::has_context() const
 SDL_WindowFlags SDLRenderer::get_window_flags() const
 {
 #if !defined(__ANDROID__)
-	return is_kmsdrm_video_driver() ? 0 : SDL_WINDOW_HIGH_PIXEL_DENSITY;
+	return kmsdrm_detected ? 0 : SDL_WINDOW_HIGH_PIXEL_DENSITY;
 #else
 	return 0;
 #endif
@@ -156,9 +151,6 @@ static bool ar_is_exact(const SDL_DisplayMode* mode, const int width, const int 
 void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 {
 	AmigaMonitor* mon = &AMonitors[monid];
-	if (mon->amiga_renderer)
-		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, w, h, SDL_LOGICAL_PRESENTATION_LETTERBOX);
-
 	if (currprefs.headless) return;
 
 	SDL_ScaleMode scale_mode = SDL_SCALEMODE_NEAREST;
@@ -175,15 +167,34 @@ void SDLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 	default: scale_mode = SDL_SCALEMODE_LINEAR; break;
 	}
 
+	int logical_width = w;
+	int logical_height = h;
+#if defined(__linux__) && !defined(__ANDROID__)
+	if (mon->amiga_renderer && !mon->screen_is_picasso && currprefs.gfx_correct_aspect
+		&& isfullscreen() > 0) {
+		int output_width = 0;
+		int output_height = 0;
+		SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &output_width, &output_height);
+		float desired_aspect = ((currprefs.gfx_auto_crop || currprefs.gfx_manual_crop) && crop_aspect > 0.0f)
+			? crop_aspect : calculate_desired_aspect(mon);
+		desired_aspect = amiberry_gfx_fullscreen_framebuffer_aspect(desired_aspect,
+			output_width, output_height, mon->desktop_width, mon->desktop_height);
+		if (desired_aspect > 0.0f && logical_height > 0) {
+			logical_width = std::max(1, static_cast<int>(logical_height * desired_aspect + 0.5f));
+			render_quad = { 0, 0, logical_width, logical_height };
+		}
+	}
+#endif
+
 	// SDL3: scale mode is per-texture, set on the amiga texture
 	if (m_amiga_texture)
 		SDL_SetTextureScaleMode(m_amiga_texture, scale_mode);
 
 	// SDL3: integer scaling via logical presentation mode
 	if (integer_scale)
-		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, w, h, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
+		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_INTEGER_SCALE);
 	else
-		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, w, h, SDL_LOGICAL_PRESENTATION_LETTERBOX);
+		SDL_SetRenderLogicalPresentation(mon->amiga_renderer, logical_width, logical_height, SDL_LOGICAL_PRESENTATION_LETTERBOX);
 }
 
 // --- OSD texture synchronization ---
@@ -336,11 +347,8 @@ void SDLRenderer::render_vkbd(int monid)
 	{
 		AmigaMonitor* mon = &AMonitors[monid];
 		if (!mon->amiga_renderer) return;
-		int dw = 0, dh = 0;
-		SDL_GetCurrentRenderOutputSize(mon->amiga_renderer, &dw, &dh);
-		if (dw <= 0 || dh <= 0) return;
 		imgui_overlay_begin_frame();
-		imgui_osk_render(dw, dh);
+		imgui_osk_render();
 		imgui_overlay_end_frame();
 	}
 }
@@ -398,23 +406,8 @@ void SDLRenderer::get_gfx_offset(int monid, float src_w, float src_h, float src_
 
 void SDLRenderer::get_drawable_size(SDL_Window* w, int* width, int* height)
 {
-	if (is_kmsdrm_video_driver()) {
-		int win_w = 0, win_h = 0;
-		int pix_w = 0, pix_h = 0;
-		SDL_GetWindowSize(w, &win_w, &win_h);
-		SDL_GetWindowSizeInPixels(w, &pix_w, &pix_h);
-		if ((pix_w != 0 && pix_w != win_w) || (pix_h != 0 && pix_h != win_h)) {
-			static bool logged_kmsdrm_drawable_mismatch = false;
-			if (!logged_kmsdrm_drawable_mismatch) {
-				write_log("KMSDRM: using window size as drawable size (window=%dx%d pixels=%dx%d)\n",
-					win_w, win_h, pix_w, pix_h);
-				logged_kmsdrm_drawable_mismatch = true;
-			}
-		}
-		*width = win_w;
-		*height = win_h;
+	if (get_kmsdrm_drawable_size(w, width, height))
 		return;
-	}
 
 	// SDL3 software path: try to find the monitor owning this window
 	for (int i = 0; i < MAX_AMIGAMONITORS; i++) {

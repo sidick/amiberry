@@ -263,8 +263,7 @@ static const TCHAR *ppc_cpu_idle[] = {
 };
 static const TCHAR *waitblits[] = { _T("disabled"), _T("automatic"), _T("noidleonly"), _T("always"), nullptr };
 static const TCHAR *autoext2[] = { _T("disabled"), _T("copy"), _T("replace"), nullptr };
-static const TCHAR *leds[] = { _T("power"), _T("df0"), _T("df1"), _T("df2"), _T("df3"), _T("hd"), _T("cd"), _T("fps"), _T("cpu"), _T("snd"), _T("md"), _T("net"), nullptr };
-static const int leds_order[] = { 3, 6, 7, 8, 9, 4, 5, 2, 1, 0, 9, 10 };
+static const TCHAR *leds[] = { _T("power"), _T("df0"), _T("df1"), _T("df2"), _T("df3"), _T("hd"), _T("cd"), _T("fps"), _T("lines"), _T("cpu"), _T("snd"), _T("md"), _T("net"), _T("caps"), _T("temp"), 0};
 static const TCHAR *lacer[] = { _T("off"), _T("i"), _T("p"), nullptr };
 /* another boolean to choice update... */
 static const TCHAR *cycleexact[] = { _T("false"), _T("memory"), _T("true"), nullptr  };
@@ -1528,7 +1527,7 @@ static void write_leds (struct zfile *f, const TCHAR *name, int mask)
 	for (int i = 0; leds[i]; i++) {
 		bool got = false;
 		for (int j = 0; leds[j]; j++) {
-			if (leds_order[j] == i) {
+			if (defaultosdledpos[i] == j) {
 				if (mask & (1 << j)) {
 					if (got)
 						_tcscat (tmp, _T(":"));
@@ -2387,17 +2386,10 @@ void cfgfile_save_options (struct zfile *f, struct uae_prefs *p, int type)
 		std::string mode;
 		std::string buffer;
 
-		// Check if configname contains JOY0, JOY1, JOY2, or JOY3
-		int joy_index = -1;
-		if (jp->idc.configname[0] && strncmp(jp->idc.configname, "JOY", 3) == 0 &&
-			jp->idc.configname[4] == '\0' &&
-			jp->idc.configname[3] >= '0' && jp->idc.configname[3] <= '3') {
-			joy_index = jp->idc.configname[3] - '0';
-			}
-		if (joy_index == -1)
+		controller_mapping mapping{};
+		if (!amiberry_get_port_joystick_custom_mapping(
+			i, jp->idc.name, jp->idc.configname, mapping))
 			continue;
-
-		didata* did = &di_joystick[joy_index];
 
 		for (int m = 0; m < 2; ++m)
 		{
@@ -2405,7 +2397,7 @@ void cfgfile_save_options (struct zfile *f, struct uae_prefs *p, int type)
 			for (int n = 0; n < SDL_GAMEPAD_BUTTON_COUNT; ++n) // loop through all buttons
 			{
 				buffer = "joyport" + std::to_string(i) + "_amiberry_custom_" + mode + "_" + SDL_GetGamepadStringForButton(static_cast<SDL_GamepadButton>(n));
-				const auto b = m == 0 ? did->mapping.amiberry_custom_none[n] : did->mapping.amiberry_custom_hotkey[n];
+				const auto b = m == 0 ? mapping.amiberry_custom_none[n] : mapping.amiberry_custom_hotkey[n];
 
 				_tcscpy(tmp2, b > 0 ? _T(find_inputevent_name(b)) : _T(""));
 				cfgfile_dwrite_str(f, buffer.c_str(), tmp2);
@@ -2414,7 +2406,7 @@ void cfgfile_save_options (struct zfile *f, struct uae_prefs *p, int type)
 			for (int n = 0; n < SDL_GAMEPAD_AXIS_COUNT; ++n)
 			{
 				buffer = "joyport" + std::to_string(i) + "_amiberry_custom_axis_" + mode + "_" + SDL_GetGamepadStringForAxis(static_cast<SDL_GamepadAxis>(n));
-				const auto b = m == 0 ? did->mapping.amiberry_custom_axis_none[n] : did->mapping.amiberry_custom_axis_hotkey[n];
+				const auto b = m == 0 ? mapping.amiberry_custom_axis_none[n] : mapping.amiberry_custom_axis_hotkey[n];
 
 				_tcscpy(tmp2, b > 0 ? _T(find_inputevent_name(b)) : _T(""));
 				cfgfile_dwrite_str(f, buffer.c_str(), tmp2);
@@ -2573,8 +2565,10 @@ void cfgfile_save_options (struct zfile *f, struct uae_prefs *p, int type)
 	cfgfile_write_strarr(f, _T("gfx_lores_mode"), loresmode, p->gfx_lores_mode);
 	cfgfile_write_bool (f, _T("gfx_flickerfixer"), p->gfx_scandoubler);
 	cfgfile_write_strarr(f, _T("gfx_linemode"), linemode, p->gfx_vresolution > 0 ? p->gfx_iscanlines * 4 + p->gfx_pscanlines + 1 : 0);
-	cfgfile_write_strarr(f, _T("gfx_fullscreen_amiga"), fullmodes, p->gfx_apmode[0].gfx_fullscreen);
-	cfgfile_write_strarr(f, _T("gfx_fullscreen_picasso"), fullmodes, p->gfx_apmode[1].gfx_fullscreen);
+	cfgfile_write_strarr(f, _T("gfx_fullscreen_amiga"), fullmodes,
+		amiberry_normalize_gfx_fullscreen_mode(p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen));
+	cfgfile_write_strarr(f, _T("gfx_fullscreen_picasso"), fullmodes,
+		amiberry_normalize_gfx_fullscreen_mode(p->gfx_apmode[APMODE_RTG].gfx_fullscreen));
 	cfgfile_write_strarr(f, _T("gfx_center_horizontal"), centermode1, p->gfx_xcenter);
 	cfgfile_write_strarr(f, _T("gfx_center_vertical"), centermode1, p->gfx_ycenter);
 	cfgfile_write_bool(f, _T("gfx_keep_aspect"), p->gfx_keep_aspect);
@@ -3994,6 +3988,18 @@ static int cfgfile_parse_host (struct uae_prefs *p, TCHAR *option, TCHAR *value)
 		return 1;
 	}
 #endif
+	if (cfgfile_strval(option, value, _T("gfx_fullscreen_amiga"),
+		&p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen, fullmodes, 0)) {
+		p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen = amiberry_normalize_gfx_fullscreen_mode(
+			p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen);
+		return 1;
+	}
+	if (cfgfile_strval(option, value, _T("gfx_fullscreen_picasso"),
+		&p->gfx_apmode[APMODE_RTG].gfx_fullscreen, fullmodes, 0)) {
+		p->gfx_apmode[APMODE_RTG].gfx_fullscreen = amiberry_normalize_gfx_fullscreen_mode(
+			p->gfx_apmode[APMODE_RTG].gfx_fullscreen);
+		return 1;
+	}
 
 	if (cfgfile_strval (option, value, _T("sound_output"), &p->produce_sound, soundmode1, 1)
 		|| cfgfile_strval (option, value, _T("sound_output"), &p->produce_sound, soundmode2, 0)
@@ -4006,8 +4012,6 @@ static int cfgfile_parse_host (struct uae_prefs *p, TCHAR *option, TCHAR *value)
 		|| cfgfile_strval (option, value, _T("gfx_resolution"), &p->gfx_resolution, lorestype1, 0)
 		|| cfgfile_strval (option, value, _T("gfx_lores"), &p->gfx_resolution, lorestype2, 0)
 		|| cfgfile_strval (option, value, _T("gfx_lores_mode"), &p->gfx_lores_mode, loresmode, 0)
-		|| cfgfile_strval (option, value, _T("gfx_fullscreen_amiga"), &p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen, fullmodes, 0)
-		|| cfgfile_strval (option, value, _T("gfx_fullscreen_picasso"), &p->gfx_apmode[APMODE_RTG].gfx_fullscreen, fullmodes, 0)
 		|| cfgfile_strval (option, value, _T("gfx_center_horizontal"), &p->gfx_xcenter, centermode1, 1)
 		|| cfgfile_strval (option, value, _T("gfx_center_vertical"), &p->gfx_ycenter, centermode1, 1)
 		|| cfgfile_strval (option, value, _T("gfx_center_horizontal"), &p->gfx_xcenter, centermode2, 0)
@@ -6592,17 +6596,15 @@ static int cfgfile_parse_hardware (struct uae_prefs *p, const TCHAR *option, TCH
 		if (cfgfile_string(option, value, tmp, tmpbuf, sizeof tmpbuf / sizeof(TCHAR))) {
 			rbc->rtgmem_type = 0;
 			rbc->rtg_index = i;
-			int j = 0;
-			for (;;) {
-				const TCHAR *t = gfxboard_get_configname(j);
-				if (!t) {
+			for (int j = 0;; j++) {
+				const int id = gfxboard_get_id_from_index(j);
+				if (id < 0)
 					break;
-				}
+				const TCHAR *t = gfxboard_get_configname(id);
 				if (!_tcsicmp(t, tmpbuf)) {
-					rbc->rtgmem_type = j;
+					rbc->rtgmem_type = id;
 					break;
 				}
-				j++;
 			}
 			return 1;
 		}
@@ -7475,6 +7477,10 @@ static int cfgfile_load_2 (struct uae_prefs *p, const TCHAR *filename, bool real
 	if (! fh)
 		return 0;
 #endif
+#ifdef AMIBERRY
+	if (real && (askedtype == 0 || (askedtype & CONFIG_TYPE_HOST)))
+		amiberry_clear_port_joystick_custom_mappings();
+#endif
 
 	while (cfg_fgets (linea, sizeof (linea), fh) != nullptr) {
 		trimwsa (linea);
@@ -7859,8 +7865,10 @@ static void parse_gfx_specs (struct uae_prefs *p, const TCHAR *spec)
 	p->gfx_pscanlines = _tcschr (x2, 'D') != nullptr;
 	if (p->gfx_pscanlines)
 		p->gfx_vresolution = VRES_DOUBLE;
-	p->gfx_apmode[0].gfx_fullscreen = _tcschr (x2, 'a') != nullptr;
-	p->gfx_apmode[1].gfx_fullscreen = _tcschr (x2, 'p') != nullptr;
+	p->gfx_apmode[APMODE_NATIVE].gfx_fullscreen = _tcschr(x2, 'a') != nullptr
+		? GFX_FULLWINDOW : GFX_WINDOW;
+	p->gfx_apmode[APMODE_RTG].gfx_fullscreen = _tcschr(x2, 'p') != nullptr
+		? GFX_FULLWINDOW : GFX_WINDOW;
 
 	free (x0);
 	return;
@@ -8089,24 +8097,28 @@ int parse_cmdline_option (struct uae_prefs *p, TCHAR c, const TCHAR *arg)
 		cmdpath (p->floppyslots[0].df, arg, 255);
 #ifdef AMIBERRY
 		target_addtorecent(arg, 0);
+		set_last_active_config_from_media(arg);
 #endif
 		break;
 	case '1':
 		cmdpath (p->floppyslots[1].df, arg, 255);
 #ifdef AMIBERRY
 		target_addtorecent(arg, 0);
+		set_last_active_config_from_media(arg);
 #endif
 		break;
 	case '2':
 		cmdpath (p->floppyslots[2].df, arg, 255);
 #ifdef AMIBERRY
 		target_addtorecent(arg, 0);
+		set_last_active_config_from_media(arg);
 #endif
 		break;
 	case '3':
 		cmdpath (p->floppyslots[3].df, arg, 255);
 #ifdef AMIBERRY
 		target_addtorecent(arg, 0);
+		set_last_active_config_from_media(arg);
 #endif
 		break;
 
@@ -10638,6 +10650,125 @@ void error_log (const TCHAR *format, ...)
 }
 
 #ifdef AMIBERRY
+static int configure_rp9_early_system_rom(struct uae_prefs* p, const int rom)
+{
+	int roms[4];
+
+	// An RP9 configuration ROM is a requirement. Alternatives below are only
+	// regional or hardware variants of that exact Kickstart release.
+	switch (rom)
+	{
+	case 100:
+		roms[0] = 1;
+		roms[1] = -1;
+		break;
+	case 110:
+		roms[0] = p->ntscmode ? 2 : 3;
+		roms[1] = p->ntscmode ? 3 : 2;
+		roms[2] = -1;
+		break;
+	case 120:
+		roms[0] = 5;
+		roms[1] = 4;
+		roms[2] = -1;
+		break;
+	case 130:
+		roms[0] = 6;
+		roms[1] = -1;
+		break;
+	case 204:
+		roms[0] = 7;
+		roms[1] = -1;
+		break;
+	case 205:
+		roms[0] = 10;
+		roms[1] = 9;
+		roms[2] = 8;
+		roms[3] = -1;
+		break;
+	case 310:
+		roms[0] = 14;
+		roms[1] = -1;
+		break;
+	default:
+		return 0;
+	}
+	return configure_rom(p, roms, 0);
+}
+
+int configure_rp9_system_rom(struct uae_prefs* p, const rp9_system_model model, const int rom)
+{
+	int roms[4];
+	switch (model)
+	{
+	case rp9_system_model::a1000:
+		if (rom != 100 && rom != 110 && rom != 120 && rom != 130)
+			return 0;
+		return configure_rp9_early_system_rom(p, rom);
+	case rp9_system_model::a500:
+	case rp9_system_model::a2000:
+		if (rom != 100 && rom != 110 && rom != 120 && rom != 130 && rom != 310)
+			return 0;
+		return configure_rp9_early_system_rom(p, rom);
+	case rp9_system_model::a500plus:
+		if (rom != 120 && rom != 130 && rom != 204 && rom != 310)
+			return 0;
+		return configure_rp9_early_system_rom(p, rom);
+	case rp9_system_model::a600:
+		if (rom != 120 && rom != 130 && rom != 204 && rom != 205 && rom != 310)
+			return 0;
+		return configure_rp9_early_system_rom(p, rom);
+	case rp9_system_model::a1200:
+		if (rom == 300)
+			roms[0] = 11;
+		else if (rom == 310)
+			roms[0] = 15;
+		else
+			return 0;
+		roms[1] = -1;
+		return configure_rom(p, roms, 0);
+	case rp9_system_model::a3000:
+		if (rom == 130)
+			roms[0] = 32;
+		else if (rom == 204)
+			roms[0] = 71;
+		else if (rom == 310)
+			roms[0] = 61;
+		else
+			return 0;
+		roms[1] = -1;
+		return configure_rom(p, roms, 0);
+	case rp9_system_model::a4000:
+		if (rom == 300) {
+			roms[0] = 12;
+			roms[1] = -1;
+		} else if (rom == 310) {
+			roms[0] = 16;
+			roms[1] = 31;
+			roms[2] = 13;
+			roms[3] = -1;
+		} else {
+			return 0;
+		}
+		return configure_rom(p, roms, 0);
+	case rp9_system_model::cdtv:
+		if (rom != 120 && rom != 130 && rom != 310)
+			return 0;
+		if (!configure_rp9_early_system_rom(p, rom))
+			return 0;
+		roms[0] = 20;
+		roms[1] = 21;
+		roms[2] = 22;
+		roms[3] = -1;
+		return configure_rom(p, roms, 0);
+	case rp9_system_model::cd32:
+		if (rom != 310 && rom != RP9_SYSTEM_ROM_310_CD32)
+			return 0;
+		return bip_cd32(p, 0, 0, 0);
+	}
+	return 0;
+}
+
 int bip_a4000(struct uae_prefs* p, int rom)
 {
 	return bip_a4000(p, 0, 0, 0);
@@ -10674,7 +10805,7 @@ int bip_a500plus(struct uae_prefs* p, int rom)
 {
 	int roms[4];
 
-	int v = bip_a500p(p, 0, 0, 0);
+	bip_a500p(p, 0, 0, 0);
 	if (rom == 130)
 	{
 		roms[0] = 6;
@@ -10692,26 +10823,49 @@ int bip_a500plus(struct uae_prefs* p, int rom)
 	return configure_rom(p, roms, 0);
 }
 
-int bip_a500(struct uae_prefs* p, int rom)
+static int configure_a500_a2000_rom(struct uae_prefs* p, int rom)
 {
 	int roms[4];
 
-	int v = bip_a500(p, 0, 0, 0);
-	if (rom == 130)
+	// General model selection keeps compatible fallbacks for users who do not
+	// have the preferred ROM. RP9 requirements use the strict helper above.
+	switch (rom)
 	{
+	case 100:
+		roms[0] = 1;
+		roms[1] = 3;
+		roms[2] = 2;
+		break;
+	case 110:
+		roms[0] = p->ntscmode ? 2 : 3;
+		roms[1] = p->ntscmode ? 3 : 2;
+		roms[2] = 1;
+		break;
+	case 130:
 		roms[0] = 6;
 		roms[1] = 5;
 		roms[2] = 4;
-		roms[3] = -1;
-	}
-	else
-	{
+		break;
+	case 310:
+		roms[0] = 14;
+		roms[1] = 6;
+		roms[2] = 5;
+		break;
+	case 120:
+	default:
 		roms[0] = 5;
 		roms[1] = 4;
 		roms[2] = 3;
-		roms[3] = -1;
+		break;
 	}
+	roms[3] = -1;
 	return configure_rom(p, roms, 0);
+}
+
+int bip_a500(struct uae_prefs* p, int rom)
+{
+	bip_a500(p, 0, 0, 0);
+	return configure_a500_a2000_rom(p, rom);
 }
 
 int bip_a600(struct uae_prefs* p, int rom)
@@ -10726,22 +10880,6 @@ int bip_a1000(struct uae_prefs* p, int rom)
 
 int bip_a2000(struct uae_prefs* p, int rom)
 {
-	int roms[4];
-
-	if (rom == 130)
-	{
-		roms[0] = 6;
-		roms[1] = 5;
-		roms[2] = 4;
-		roms[3] = -1;
-	}
-	else
-	{
-		roms[0] = 5;
-		roms[1] = 4;
-		roms[2] = 3;
-		roms[3] = -1;
-	}
 	p->cs_compatible = CP_A2000;
 	built_in_chipset_prefs(p);
 	p->chipmem.size = 0x00080000;
@@ -10750,7 +10888,7 @@ int bip_a2000(struct uae_prefs* p, int rom)
 	p->cpu_compatible = false;
 	p->nr_floppies = 1;
 	p->floppyslots[1].dfxtype = DRV_NONE;
-	return configure_rom(p, roms, 0);
+	return configure_a500_a2000_rom(p, rom);
 }
 
 int bip_a3000(struct uae_prefs* p, int rom)

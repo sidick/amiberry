@@ -5,6 +5,7 @@
 #include "gui/gui_handling.h"
 #include "amiberry_gfx.h"
 #include "target.h"
+#include "shader_catalog.h"
 #include <algorithm>
 #include <filesystem>
 #include <vector>
@@ -16,9 +17,6 @@
 #include "shader_preset.h"
 #include "opengl_renderer.h"
 #endif
-
-// Built-in shader names
-static const char* builtin_shaders[] = { "none", "tv", "pc", "lite", "1084" };
 
 // Bezel list storage
 static std::vector<std::string> bezel_names;
@@ -62,6 +60,13 @@ static void scan_bezels()
 	bezels_initialized = true;
 }
 
+const std::vector<std::string>& get_available_bezel_names()
+{
+	if (!bezels_initialized)
+		scan_bezels();
+	return bezel_names;
+}
+
 static int find_bezel_index(const char* bezel_name)
 {
 	for (size_t i = 0; i < bezel_names.size(); i++) {
@@ -70,79 +75,22 @@ static int find_bezel_index(const char* bezel_name)
 	return 0; // Default to "none"
 }
 
-// Shader list storage
-static std::vector<std::string> shader_names;
-static std::vector<const char*> shader_items;
-static bool shaders_initialized = false;
-
-// Scan for available shaders (built-in + .glsl + .glslp files)
-static void scan_shaders()
-{
-	shader_names.clear();
-	shader_items.clear();
-
-	// Add built-in shaders first
-	for (auto & builtin_shader : builtin_shaders) {
-		shader_names.emplace_back(builtin_shader);
-	}
-
-	// Scan shaders directory for shader files:
-	// - .glsl files: top-level only (user's custom single-pass shaders)
-	// - .glslp presets: recursively (e.g. crt/crt-aperture.glslp)
-	std::string shaders_dir = get_shaders_path();
-	if (!shaders_dir.empty()) {
-		namespace fs = std::filesystem;
-		fs::path base_path(shaders_dir);
-		try {
-			for (const auto& entry : fs::recursive_directory_iterator(base_path,
-				fs::directory_options::skip_permission_denied)) {
-				if (!entry.is_regular_file()) continue;
-
-				std::string filename = entry.path().filename().string();
-				bool is_glslp = filename.size() > 6 &&
-					filename.substr(filename.size() - 6) == ".glslp";
-				bool is_glsl = !is_glslp && filename.size() > 5 &&
-					filename.substr(filename.size() - 5) == ".glsl";
-
-				if (!is_glsl && !is_glslp) continue;
-
-				// For .glsl files, only include those at the top level
-				// (subdirectory .glsl files are shader components, not standalone)
-				if (is_glsl && entry.path().parent_path() != base_path) continue;
-
-				// Store path relative to shaders base dir
-				fs::path rel = fs::relative(entry.path(), base_path);
-				std::string rel_str = rel.generic_string(); // use forward slashes
-				shader_names.push_back(rel_str);
-			}
-		} catch (...) {
-			// Directory doesn't exist or can't be read - ignore
-		}
-	}
-
-	// Sort external shaders alphabetically (after built-in shaders)
-	std::sort(shader_names.begin() + 5, shader_names.end());
-
-	// Build const char* array for ImGui
-	for (const auto& name : shader_names) {
-		shader_items.push_back(name.c_str());
-	}
-
-	shaders_initialized = true;
-}
-
-// Find index of shader name in list
-static int find_shader_index(const char* shader_name)
+static int find_shader_index(const std::vector<std::string>& shader_names, const char* shader_name)
 {
 	for (size_t i = 0; i < shader_names.size(); i++) {
 		if (shader_names[i] == shader_name) {
 			return static_cast<int>(i);
 		}
 	}
-	return 0;  // Default to "none"
+	return -1;
 }
 
 static bool show_shader_params_popup = false;
+#ifdef USE_OPENGL
+static bool shader_params_popup_rtg = false;
+static std::string shader_params_popup_name;
+static std::vector<ShaderParameter> shader_params_popup_parameters;
+#endif
 
 static void save_filter_defaults()
 {
@@ -158,7 +106,39 @@ static void save_filter_defaults()
 	save_amiberry_settings();
 }
 
-static void render_shader_parameters_popup()
+#ifdef USE_OPENGL
+void ShaderParameters_Open(const char* shader_name, const bool rtg)
+{
+	shader_params_popup_name = shader_name ? shader_name : "none";
+	shader_params_popup_rtg = rtg;
+	shader_params_popup_parameters.clear();
+
+	bool parameters_available = false;
+	if (auto* gl_renderer = get_opengl_renderer()) {
+		gl_renderer->ensure_shader_parameters(shader_params_popup_name.c_str(), rtg);
+		parameters_available = gl_renderer->shader_parameters(
+			shader_params_popup_name.c_str(), rtg) != nullptr;
+	}
+
+	if (!parameters_available
+		&& load_shader_parameter_metadata(
+			shader_params_popup_name.c_str(), shader_params_popup_parameters)) {
+		for (auto& parameter : shader_params_popup_parameters) {
+			for (const auto& saved : amiberry_options.shader_parameters) {
+				if (saved.rtg == rtg && saved.shader == shader_params_popup_name
+					&& saved.name == parameter.name) {
+					parameter.current_value = std::max(parameter.min_value,
+						std::min(parameter.max_value, saved.value));
+					break;
+				}
+			}
+		}
+	}
+	show_shader_params_popup = true;
+}
+#endif
+
+void ShaderParameters_RenderPopup()
 {
 	if (!show_shader_params_popup) return;
 
@@ -166,21 +146,59 @@ static void render_shader_parameters_popup()
 	ImGui::SetNextWindowSize(ImVec2(BUTTON_WIDTH * 5, BUTTON_HEIGHT * 10), ImGuiCond_FirstUseEver);
 	ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
 	ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-	if (ImGui::Begin("Shader Parameters", &show_shader_params_popup)) {
-		std::vector<ShaderParameter>* params = nullptr;
-
-		auto* gl_renderer = g_renderer ? dynamic_cast<OpenGLRenderer*>(g_renderer.get()) : nullptr;
-		ShaderState* shader = gl_renderer ? &gl_renderer->shader_state() : nullptr;
-
-		if (shader && shader->preset && shader->preset->is_valid()) {
-			params = &shader->preset->get_all_parameters();
-		} else if (shader && shader->external && shader->external->is_valid()) {
-			params = const_cast<std::vector<ShaderParameter>*>(&shader->external->get_parameters());
-		}
+	const char* popup_title = shader_params_popup_rtg ? "RTG Shader Parameters" : "Native Shader Parameters";
+	if (ImGui::Begin(popup_title, &show_shader_params_popup)) {
+		auto* gl_renderer = get_opengl_renderer();
+		auto* params = gl_renderer
+			? gl_renderer->shader_parameters(shader_params_popup_name.c_str(), shader_params_popup_rtg)
+			: nullptr;
+		if (!params)
+			params = &shader_params_popup_parameters;
 
 		if (params && !params->empty()) {
-			ImGui::Text("Adjust shader parameters:");
+			ImGui::Text("Shader: %s", shader_params_popup_name.c_str());
+			ImGui::Spacing();
+
+			if (AmigaButton(ICON_FA_ARROW_ROTATE_LEFT " Reset to Shader Defaults",
+				ImVec2(BUTTON_WIDTH * 2.25f, BUTTON_HEIGHT))) {
+				for (auto& param : *params) {
+					param.current_value = param.default_value;
+					if (gl_renderer) {
+						gl_renderer->set_shader_parameter(shader_params_popup_name.c_str(),
+							shader_params_popup_rtg, param.name, param.default_value);
+					}
+				}
+			}
+			ShowHelpMarker("Restore the values declared by this shader.");
+			ImGui::SameLine();
+			if (AmigaButton(ICON_FA_FLOPPY_DISK " Save Parameters",
+				ImVec2(BUTTON_WIDTH * 1.75f, BUTTON_HEIGHT))) {
+				if (gl_renderer) {
+					gl_renderer->save_shader_parameters(
+						shader_params_popup_name.c_str(), shader_params_popup_rtg);
+				} else {
+					auto& saved = amiberry_options.shader_parameters;
+					saved.erase(std::remove_if(saved.begin(), saved.end(),
+						[](const amiberry_shader_parameter& parameter) {
+							return parameter.rtg == shader_params_popup_rtg
+								&& parameter.shader == shader_params_popup_name;
+						}), saved.end());
+					for (const auto& parameter : *params) {
+						if (parameter.current_value != parameter.default_value) {
+							saved.push_back({shader_params_popup_rtg, shader_params_popup_name,
+								parameter.name, parameter.current_value});
+						}
+					}
+				}
+				save_amiberry_settings();
+			}
+			ShowHelpMarker(shader_params_popup_rtg
+				? "Save these values as the defaults for the RTG shader."
+				: "Save these values as the defaults for the native shader.");
+
+			ImGui::Spacing();
 			ImGui::Separator();
+			ImGui::Text("Adjust shader parameters:");
 			ImGui::Spacing();
 
 			for (auto& param : *params) {
@@ -192,31 +210,19 @@ static void render_shader_parameters_popup()
 				ImGui::SetNextItemWidth(-1);
 				if (ImGui::SliderFloat("##val", &param.current_value,
 					param.min_value, param.max_value, "%.3f")) {
-					// Apply the parameter change
-					if (shader && shader->preset) {
-						shader->preset->set_parameter(param.name, param.current_value);
-					} else if (shader && shader->external) {
-						shader->external->set_parameter(param.name, param.current_value);
+					if (gl_renderer) {
+						gl_renderer->set_shader_parameter(shader_params_popup_name.c_str(),
+							shader_params_popup_rtg, param.name, param.current_value);
 					}
 				}
 				AmigaBevel(ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), false);
 				ImGui::PopID();
 			}
-
-			ImGui::Spacing();
-			ImGui::Separator();
-			if (AmigaButton(ICON_FA_ARROW_ROTATE_LEFT " Reset to Defaults")) {
-				for (auto& param : *params) {
-					param.current_value = param.default_value;
-					if (shader && shader->preset) {
-						shader->preset->set_parameter(param.name, param.default_value);
-					} else if (shader && shader->external) {
-						shader->external->set_parameter(param.name, param.default_value);
-					}
-				}
-			}
 		} else {
-			ImGui::Text("No adjustable parameters for the current shader.");
+			ImGui::Text("Shader: %s", shader_params_popup_name.c_str());
+			ImGui::Spacing();
+			ImGui::TextWrapped("No adjustable parameters are currently available for this %s shader.",
+				shader_params_popup_rtg ? "RTG" : "native");
 		}
 	}
 	ImGui::End();
@@ -230,10 +236,7 @@ void render_panel_filter()
 	ImGui::Indent(4.0f);
 	const float spacing = ImGui::GetStyle().ItemSpacing.x;
 
-	// Initialize shader list on first call
-	if (!shaders_initialized) {
-		scan_shaders();
-	}
+	const auto& shader_names = get_available_shader_names();
 
 	BeginGroupBox("Crop and Offset");
 	if (changed_prefs.gfx_manual_crop) ImGui::BeginDisabled();
@@ -302,13 +305,15 @@ void render_panel_filter()
 	// Native Shader Selection
 	BeginGroupBox("Native Display Shader");
 	{
-		int native_idx = find_shader_index(changed_prefs.shader);
+		const int native_idx = find_shader_index(shader_names, changed_prefs.shader);
+		const char* native_preview = native_idx >= 0
+			? shader_names[native_idx].c_str() : changed_prefs.shader;
 		const float native_label_w = ImGui::CalcTextSize("Shader for native Amiga modes").x;
 		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - native_label_w - spacing * 3);
-		if (ImGui::BeginCombo("##NativeShader", shader_items[native_idx])) {
-			for (int i = 0; i < static_cast<int>(shader_items.size()); i++) {
+		if (ImGui::BeginCombo("##NativeShader", native_preview)) {
+			for (int i = 0; i < static_cast<int>(shader_names.size()); i++) {
 				bool is_selected = (i == native_idx);
-				if (ImGui::Selectable(shader_items[i], is_selected)) {
+				if (ImGui::Selectable(shader_names[i].c_str(), is_selected)) {
 					strncpy(changed_prefs.shader, shader_names[i].c_str(),
 							sizeof(changed_prefs.shader) - 1);
 					changed_prefs.shader[sizeof(changed_prefs.shader) - 1] = '\0';
@@ -321,6 +326,14 @@ void render_panel_filter()
 		ShowHelpMarker("CRT shader applied to native Amiga chipset display modes.");
 		ImGui::SameLine();
 		ImGui::Text("Shader for native Amiga modes");
+		ImGui::Spacing();
+#ifdef USE_OPENGL
+		if (AmigaButton(ICON_FA_SLIDERS " Shader Parameters...##NativeShaderParameters",
+			ImVec2(BUTTON_WIDTH * 1.75f, BUTTON_HEIGHT))) {
+			ShaderParameters_Open(changed_prefs.shader, false);
+		}
+		ShowHelpMarker("Edit parameters for the native display shader.");
+#endif
 	}
 	EndGroupBox("Native Display Shader");
 
@@ -329,13 +342,15 @@ void render_panel_filter()
 	// RTG Shader Selection
 	BeginGroupBox("RTG Display Shader");
 	{
-		int rtg_idx = find_shader_index(changed_prefs.shader_rtg);
+		const int rtg_idx = find_shader_index(shader_names, changed_prefs.shader_rtg);
+		const char* rtg_preview = rtg_idx >= 0
+			? shader_names[rtg_idx].c_str() : changed_prefs.shader_rtg;
 		const float rtg_label_w = ImGui::CalcTextSize("Shader for RTG/Picasso modes").x;
 		ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - rtg_label_w - spacing * 3);
-		if (ImGui::BeginCombo("##RTGShader", shader_items[rtg_idx])) {
-			for (int i = 0; i < static_cast<int>(shader_items.size()); i++) {
+		if (ImGui::BeginCombo("##RTGShader", rtg_preview)) {
+			for (int i = 0; i < static_cast<int>(shader_names.size()); i++) {
 				bool is_selected = (i == rtg_idx);
-				if (ImGui::Selectable(shader_items[i], is_selected)) {
+				if (ImGui::Selectable(shader_names[i].c_str(), is_selected)) {
 					strncpy(changed_prefs.shader_rtg, shader_names[i].c_str(),
 							sizeof(changed_prefs.shader_rtg) - 1);
 					changed_prefs.shader_rtg[sizeof(changed_prefs.shader_rtg) - 1] = '\0';
@@ -348,6 +363,14 @@ void render_panel_filter()
 		ShowHelpMarker("CRT shader applied to RTG/Picasso96 graphics card display modes.");
 		ImGui::SameLine();
 		ImGui::Text("Shader for RTG/Picasso modes");
+		ImGui::Spacing();
+#ifdef USE_OPENGL
+		if (AmigaButton(ICON_FA_SLIDERS " Shader Parameters...##RTGShaderParameters",
+			ImVec2(BUTTON_WIDTH * 1.75f, BUTTON_HEIGHT))) {
+			ShaderParameters_Open(changed_prefs.shader_rtg, true);
+		}
+		ShowHelpMarker("Edit parameters for the RTG display shader.");
+#endif
 	}
 	EndGroupBox("RTG Display Shader");
 
@@ -411,24 +434,17 @@ void render_panel_filter()
 
 	// Rescan button
 	if (AmigaButton(ICON_FA_ARROWS_ROTATE " Rescan Shaders & Bezels", ImVec2(BUTTON_WIDTH * 2.0f, BUTTON_HEIGHT))) {
-		shaders_initialized = false;  // Force rescan on next frame
+		invalidate_shader_catalog();
 		bezels_initialized = false;
 	}
 	ImGui::SameLine();
 
-	// Shader Parameters button (only shown when active shader has parameters)
-	if (g_renderer && g_renderer->has_shader_parameters()) {
-		if (AmigaButton(ICON_FA_SLIDERS " Shader Parameters...", ImVec2(BUTTON_WIDTH * 1.5f, BUTTON_HEIGHT))) {
-			show_shader_params_popup = true;
-		}
-		ImGui::SameLine();
-	}
-
 	// Save button
-	if (AmigaButton(ICON_FA_FLOPPY_DISK " Save Defaults", ImVec2(BUTTON_WIDTH * 1.5f, BUTTON_HEIGHT))) {
+	if (AmigaButton(ICON_FA_FLOPPY_DISK " Save Defaults", ImVec2(BUTTON_WIDTH * 1.75f, BUTTON_HEIGHT))) {
 		save_filter_defaults();
 	}
+	ShowHelpMarker("Save the shader selections and bezel settings as application defaults.");
 
 	// Render the shader parameters popup if open
-	render_shader_parameters_popup();
+	ShaderParameters_RenderPopup();
 }

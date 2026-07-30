@@ -79,11 +79,25 @@ sealed interface LaunchRequest {
 		}
 	}
 
+	data class Rp9(
+		val path: String,
+		val controlOverrides: AndroidControlOverrides? = null
+	) : LaunchRequest {
+		override fun toArgs(): Array<String> {
+			val args = mutableListOf("--rescan-roms", "--autoload", path)
+			// RP9 rebuilds machine preferences, so Android-only controls must follow autoload.
+			controlOverrides?.let { args.addAll(it.toArgs()) }
+			args.add("-G")
+			return args.toTypedArray()
+		}
+	}
+
 	data class AndroidControlOverrides(
 		val joyport0: String,
 		val joyport1: String,
 		val onScreenJoystick: Boolean,
-		val onScreenKeyboard: Boolean
+		val onScreenKeyboard: Boolean,
+		val onScreenKeyboardNumpad: Boolean = false
 	) {
 		fun toArgs(): List<String> {
 			val args = mutableListOf("-s", "joyport0=$joyport0")
@@ -95,6 +109,7 @@ sealed interface LaunchRequest {
 				listOf(
 					"-s", "amiberry.onscreen_joystick=${onScreenJoystick.toCfg()}",
 					"-s", "amiberry.vkbd_enabled=${onScreenKeyboard.toCfg()}",
+					"-s", "amiberry.vkbd_numpad=${onScreenKeyboardNumpad.toCfg()}",
 					"-s", "input.default_osk=${onScreenKeyboard.toCfg()}"
 				)
 			)
@@ -108,7 +123,8 @@ sealed interface LaunchRequest {
 					joyport0 = settings.joyport0,
 					joyport1 = settings.joyport1,
 					onScreenJoystick = settings.onScreenJoystick,
-					onScreenKeyboard = settings.onScreenKeyboard
+					onScreenKeyboard = settings.onScreenKeyboard,
+					onScreenKeyboardNumpad = settings.onScreenKeyboardNumpad
 				)
 		}
 	}

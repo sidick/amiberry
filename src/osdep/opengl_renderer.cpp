@@ -19,6 +19,7 @@
 
 #include "opengl_renderer.h"
 #include "amiberry_gfx.h"
+#include "amiberry_gfx_geometry.h"
 #include "gfx_window.h"
 #include "drawing.h"
 #include "fsdb_host.h"
@@ -34,7 +35,9 @@
 #include "imgui_osk.h"
 #include "on_screen_joystick.h"
 #include "gui/gui_handling.h"
+#include <algorithm>
 #include <cmath>
+#include <utility>
 #include <SDL3_image/SDL_image.h>
 
 #ifndef GL_BGRA
@@ -55,12 +58,6 @@ extern float amiberry_getrefreshrate(int monid);
 OpenGLRenderer* get_opengl_renderer()
 {
 	return dynamic_cast<OpenGLRenderer*>(g_renderer.get());
-}
-
-static bool is_kmsdrm_video_driver()
-{
-	const char* driver = SDL_GetCurrentVideoDriver();
-	return driver != nullptr && strcmpi(driver, "KMSDRM") == 0;
 }
 
 static const uae_prefs& get_active_filter_prefs()
@@ -105,6 +102,7 @@ static void resolve_gl_pixel_format(uint32_t sdl_pixel_format, GLenum& fmt, GLen
 bool OpenGLRenderer::init_context(SDL_Window* window)
 {
 	write_log("DEBUG: Initializing OpenGL Context...\n");
+	amiberry_hw_vsync_pacing_set_blocking(false);
 
 	m_gl_context = SDL_GL_CreateContext(window);
 	if (!m_gl_context) {
@@ -156,6 +154,7 @@ bool OpenGLRenderer::init_context(SDL_Window* window)
 
 void OpenGLRenderer::destroy_context()
 {
+	amiberry_hw_vsync_pacing_set_blocking(false);
 	if (m_gl_context != nullptr)
 	{
 		SDL_GL_DestroyContext(m_gl_context);
@@ -177,7 +176,7 @@ SDL_WindowFlags OpenGLRenderer::get_window_flags() const
 {
 	SDL_WindowFlags flags = SDL_WINDOW_OPENGL;
 #if !defined(__ANDROID__)
-	if (!is_kmsdrm_video_driver()) {
+	if (!kmsdrm_detected) {
 		flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
 	}
 #endif
@@ -246,17 +245,21 @@ bool OpenGLRenderer::alloc_texture(int monid, int w, int h)
 
 	auto mon = &AMonitors[monid];
 	const char* shader_name = get_selected_shader_name(mon);
+	const bool shader_for_rtg = mon->screen_is_picasso;
 
-	// Skip shader recreation if already loaded with the same name.
-	// This preserves runtime parameter changes made by the user.
+	// Parameterized shaders may have different Native and RTG values, so they
+	// must be recreated when the display target changes even if the name matches.
 	bool shader_exists = (m_shader.crtemu != nullptr || m_shader.external != nullptr || m_shader.preset != nullptr);
-	if (shader_exists && m_shader.loaded_name == shader_name) {
+	const bool parameterized_shader = m_shader.external != nullptr || m_shader.preset != nullptr;
+	if (shader_exists && m_shader.loaded_name == shader_name
+		&& (!parameterized_shader || m_shader.loaded_for_rtg == shader_for_rtg)) {
 		return true;
 	}
 
 	// Clean up existing shaders (name changed or no shader loaded yet)
 	destroy_shaders();
 	m_shader.loaded_name = shader_name;
+	m_shader.loaded_for_rtg = shader_for_rtg;
 
 	// Force full render on next frame after shader switch
 	mon->full_render_needed = true;
@@ -276,6 +279,8 @@ bool OpenGLRenderer::alloc_texture(int monid, int w, int h)
 			shader_name = "none";
 		} else {
 			write_log("Shader preset loaded successfully (%d passes)\n", m_shader.preset->get_pass_count());
+			cache_shader_parameter_template();
+			restore_shader_parameters(shader_name, shader_for_rtg);
 			return true;
 		}
 	}
@@ -289,6 +294,8 @@ bool OpenGLRenderer::alloc_texture(int monid, int w, int h)
 			shader_name = "none";
 		} else {
 			write_log("External shader loaded successfully\n");
+			cache_shader_parameter_template();
+			restore_shader_parameters(shader_name, shader_for_rtg);
 			return true;
 		}
 	}
@@ -356,7 +363,10 @@ void OpenGLRenderer::set_scaling(int monid, const uae_prefs* p, int w, int h)
 
 void OpenGLRenderer::update_vsync(int monid)
 {
-	if (!AMonitors[monid].amiga_window) return;
+	if (!AMonitors[monid].amiga_window) {
+		amiberry_hw_vsync_pacing_set_blocking(false);
+		return;
+	}
 
 	const AmigaMonitor* mon = &AMonitors[monid];
 	const auto idx = mon->screen_is_picasso ? APMODE_RTG : APMODE_NATIVE;
@@ -388,8 +398,22 @@ void OpenGLRenderer::update_vsync(int monid)
 		}
 	}
 
+	// KMSDRM has no Adaptive/VRR presentation mode. SDL 3.2.x maps interval 0
+	// to an asynchronous DRM page flip and retains its default triple-buffered
+	// path, with software timing pacing the emulator. SDL 3.4+ retains the
+	// double-buffered blocking atomic path, so use interval 1 there and let
+	// matched-refresh hardware pacing account for it.
+	// Mismatched-refresh atomic presentation needs a separate scheduler.
+	if (kmsdrm_detected) {
+		interval = SDL_GetVersion() < SDL_VERSIONNUM(3, 4, 0) ? 0 : 1;
+	}
+
 	if (m_vsync.current_interval != interval) {
 		const int requested_interval = interval;
+		// Do not retain a stale blocking capability while changing the active
+		// presentation policy. Publish true only after a positive interval is
+		// applied successfully.
+		amiberry_hw_vsync_pacing_set_blocking(false);
 		if (interval == ADAPTIVE_SWAP_INTERVAL) {
 			if (!SDL_GL_SetSwapInterval(ADAPTIVE_SWAP_INTERVAL)) {
 				const std::string adaptive_error = SDL_GetError();
@@ -404,6 +428,7 @@ void OpenGLRenderer::update_vsync(int monid)
 				write_log("OpenGL VSync: Adaptive VSync enabled\n");
 			}
 		} else if (SDL_GL_SetSwapInterval(interval)) {
+			amiberry_hw_vsync_pacing_set_blocking(interval > 0);
 			write_log("OpenGL VSync: Mode %d, Interval set to %d\n", vsync_mode, interval);
 		} else {
 			write_log("OpenGL VSync: Failed to set interval %d: %s (will not retry)\n", interval, SDL_GetError());
@@ -418,6 +443,101 @@ bool OpenGLRenderer::render_frame(int monid, int mode, int immediate)
 {
 	SDL_Surface* surface = get_amiga_surface(monid);
 	return surface != nullptr;
+}
+
+bool OpenGLRenderer::ensure_shader_resolve_target(const int width, const int height)
+{
+	if (width <= 0 || height <= 0)
+		return false;
+	if (m_shader.resolve_framebuffer != 0 && m_shader.resolve_texture != 0
+		&& m_shader.resolve_width == width && m_shader.resolve_height == height) {
+		return true;
+	}
+
+	destroy_shader_resolve_target();
+
+	glGenTextures(1, &m_shader.resolve_texture);
+	glBindTexture(GL_TEXTURE_2D, m_shader.resolve_texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0,
+		GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+	glGenFramebuffers(1, &m_shader.resolve_framebuffer);
+	glBindFramebuffer(GL_FRAMEBUFFER, m_shader.resolve_framebuffer);
+	glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		GL_TEXTURE_2D, m_shader.resolve_texture, 0);
+	const bool complete = glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	if (!complete) {
+		write_log("Shader resolve framebuffer is incomplete\n");
+		destroy_shader_resolve_target();
+		return false;
+	}
+
+	m_shader.resolve_width = width;
+	m_shader.resolve_height = height;
+	return true;
+}
+
+void OpenGLRenderer::destroy_shader_resolve_target()
+{
+	if (m_shader.resolve_framebuffer != 0) {
+		glDeleteFramebuffers(1, &m_shader.resolve_framebuffer);
+		m_shader.resolve_framebuffer = 0;
+	}
+	if (m_shader.resolve_texture != 0) {
+		glDeleteTextures(1, &m_shader.resolve_texture);
+		m_shader.resolve_texture = 0;
+	}
+	m_shader.resolve_width = 0;
+	m_shader.resolve_height = 0;
+}
+
+void OpenGLRenderer::render_shader_resolve(
+	const int x, const int y, const int width, const int height)
+{
+	if (m_shader.resolve_texture == 0 || width <= 0 || height <= 0)
+		return;
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if (!init_osd_shader())
+		return;
+
+	// FBO textures already use GL's bottom-left origin, so this quad does not
+	// apply the Y-flip used for top-down SDL surfaces and overlay images.
+	static const GLfloat vertices[] = {
+		-1.0f, -1.0f, 0.0f, 0.0f,
+		 1.0f, -1.0f, 1.0f, 0.0f,
+		 1.0f,  1.0f, 1.0f, 1.0f,
+		-1.0f,  1.0f, 0.0f, 1.0f,
+	};
+
+	glViewport(x, y, width, height);
+	glDisable(GL_BLEND);
+	glDisable(GL_DEPTH_TEST);
+	glDisable(GL_CULL_FACE);
+	glUseProgram(m_overlay.osd_program);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_shader.resolve_texture);
+	if (m_overlay.osd_tex_loc != -1) glUniform1i(m_overlay.osd_tex_loc, 0);
+
+	glBindVertexArray(m_overlay.osd_vao);
+	glBindBuffer(GL_ARRAY_BUFFER, m_overlay.osd_vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STREAM_DRAW);
+	glEnableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
+	glDisableVertexAttribArray(2);
+	glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat), nullptr);
+	glDrawArrays(GL_TRIANGLE_FAN, 0, 4);
+
+	glDisableVertexAttribArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+	glBindTexture(GL_TEXTURE_2D, 0);
+	glUseProgram(0);
 }
 
 void OpenGLRenderer::present_frame(int monid, int mode)
@@ -460,6 +580,17 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		desired_aspect = calculate_desired_aspect(mon);
 	}
 	if (desired_aspect <= 0.0f) desired_aspect = 4.0f / 3.0f;
+	float integer_target_aspect = std::max(desired_aspect, 4.0f / 3.0f);
+#if defined(__linux__) && !defined(__ANDROID__)
+	if (!mon->screen_is_picasso && currprefs.gfx_correct_aspect && isfullscreen() > 0) {
+		// Linux exclusive modes may be stretched to the desktop output aspect.
+		// Convert the physical target aspect into framebuffer coordinates.
+		desired_aspect = amiberry_gfx_fullscreen_framebuffer_aspect(desired_aspect,
+			drawableWidth, drawableHeight, mon->desktop_width, mon->desktop_height);
+		integer_target_aspect = amiberry_gfx_fullscreen_framebuffer_aspect(integer_target_aspect,
+			drawableWidth, drawableHeight, mon->desktop_width, mon->desktop_height);
+	}
+#endif
 
 	const auto& filter_prefs = get_active_filter_prefs();
 
@@ -578,43 +709,17 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 					display_w, display_h, filter_prefs.gf[GF_RTG].gfx_filter_integerscalelimit);
 				destW = std::max(1, static_cast<int>(static_cast<float>(display_w) * scale + 0.5f));
 				destH = std::max(1, static_cast<int>(static_cast<float>(display_h) * scale + 0.5f));
+			} else if (!currprefs.gfx_correct_aspect) {
+				// Integer scaling without aspect correction uses the normalized
+				// crop geometry, not the desktop-sized stretch target.
+				const int scale = amiberry_gfx_native_integer_scale(
+					renderAreaW, renderAreaH, display_w, display_h);
+				destW = display_w * scale;
+				destH = display_h * scale;
 			} else {
-				// Vertical integer scale, constrained by the aspect-corrected destH
-				int h_scale = destH / display_h;
-				if (h_scale < 1) h_scale = 1;
-
-				int w_scale;
-				if (currprefs.gfx_correct_aspect) {
-					// Per-axis scaling: widen toward 4:3 when content is narrower,
-					// but never narrow content that's already wider than 4:3.
-					// At 2160p this gives exact 4:3 (9x horiz, 8x vert = 2880x2160).
-					float target_aspect = std::max(desired_aspect, 4.0f / 3.0f);
-					float ideal_w = display_h * h_scale * target_aspect;
-					int w_lo = std::max(1, static_cast<int>(ideal_w / src_w));
-					int w_hi = w_lo + 1;
-
-					// Pick the candidate closest to target aspect; prefer narrower on tie
-					float aspect_lo = static_cast<float>(src_w * w_lo) / (display_h * h_scale);
-					float aspect_hi = static_cast<float>(src_w * w_hi) / (display_h * h_scale);
-
-					if (src_w * w_hi <= renderAreaW &&
-						fabsf(aspect_hi - target_aspect) < fabsf(aspect_lo - target_aspect)) {
-						w_scale = w_hi;
-					} else {
-						w_scale = w_lo;
-					}
-
-					// Clamp to render area
-					while (src_w * w_scale > renderAreaW && w_scale > 1) w_scale--;
-				} else {
-					// Uniform scaling (no aspect correction)
-					w_scale = renderAreaW / display_w;
-					if (w_scale > h_scale) w_scale = h_scale;
-				}
-				if (w_scale < 1) w_scale = 1;
-
-				destW = src_w * w_scale;
-				destH = display_h * h_scale;
+				amiberry_gfx_correct_aspect_integer_dimensions(
+					renderAreaW, renderAreaH, src_w, display_h,
+					integer_target_aspect, destW, destH);
 			}
 		}
 
@@ -640,21 +745,43 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 	render_quad.w = destW;
 	render_quad.h = destH;
 
+	// Some CRT shaders require an output at least as large as their input. Render
+	// them at that safe size, then resolve back to the aspect-correct destination
+	// instead of letting the oversized viewport be clipped by the framebuffer.
+	int shader_viewport_w = destW;
+	int shader_viewport_h = destH;
+	amiberry_gfx_shader_render_dimensions(
+		destW, destH, src_w, src_h, shader_viewport_w, shader_viewport_h);
+	const bool custom_shader_active = (m_shader.preset && m_shader.preset->is_valid())
+		|| (m_shader.external && m_shader.external->is_valid());
+	bool use_shader_resolve = custom_shader_active
+		&& (shader_viewport_w != destW || shader_viewport_h != destH);
+	if (use_shader_resolve
+		&& !ensure_shader_resolve_target(shader_viewport_w, shader_viewport_h)) {
+		// Preserve final presentation geometry if the intermediate target cannot
+		// be allocated, even though shaders that require >= 1x may degrade.
+		shader_viewport_w = destW;
+		shader_viewport_h = destH;
+		use_shader_resolve = false;
+	}
+	const int shader_viewport_x = use_shader_resolve
+		? 0 : renderAreaX + (renderAreaW - shader_viewport_w) / 2;
+	const int shader_viewport_y = use_shader_resolve
+		? 0 : glAreaY + (renderAreaH - shader_viewport_h) / 2;
+	const GLuint shader_framebuffer = use_shader_resolve
+		? m_shader.resolve_framebuffer : 0;
+	if (use_shader_resolve) {
+		glBindFramebuffer(GL_FRAMEBUFFER, shader_framebuffer);
+		glViewport(0, 0, shader_viewport_w, shader_viewport_h);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+
 	// Handle shader preset rendering (multi-pass .glslp)
 	if (m_shader.preset && m_shader.preset->is_valid()) {
 		glDisableVertexAttribArray(0);
 		glDisableVertexAttribArray(1);
 		glDisableVertexAttribArray(2);
-
-		int viewport_w = destW;
-		int viewport_h = destH;
-		if (src_w > 0 && src_h > 0 && (viewport_w < src_w || viewport_h < src_h)) {
-			float s = std::max(static_cast<float>(src_w) / viewport_w, static_cast<float>(src_h) / viewport_h);
-			viewport_w = static_cast<int>(viewport_w * s);
-			viewport_h = static_cast<int>(viewport_h * s);
-		}
-		int viewport_x = renderAreaX + (renderAreaW - viewport_w) / 2;
-		int viewport_y = glAreaY + (renderAreaH - viewport_h) / 2;
 
 		static int preset_frame_count = 0;
 
@@ -662,11 +789,13 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 			uae_u8* crop_ptr = static_cast<uae_u8*>(surface->pixels) + (crop_y * surface->pitch) + (crop_x * m_gl_format.bpp);
 
 			m_shader.preset->render(crop_ptr, crop_w, crop_h, surface->pitch,
-				viewport_x, viewport_y, viewport_w, viewport_h, preset_frame_count++);
+				shader_viewport_x, shader_viewport_y, shader_viewport_w, shader_viewport_h,
+				preset_frame_count++, shader_framebuffer);
 		} else if (surface) {
 			m_shader.preset->render(static_cast<const unsigned char*>(surface->pixels),
 				surface->w, surface->h, surface->pitch,
-				viewport_x, viewport_y, viewport_w, viewport_h, preset_frame_count++);
+				shader_viewport_x, shader_viewport_y, shader_viewport_w, shader_viewport_h,
+				preset_frame_count++, shader_framebuffer);
 		}
 
 	}
@@ -677,28 +806,23 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		glDisableVertexAttribArray(1);
 		glDisableVertexAttribArray(2);
 
-		int viewport_w = destW;
-		int viewport_h = destH;
-		if (src_w > 0 && src_h > 0 && (viewport_w < src_w || viewport_h < src_h)) {
-			float s = std::max(static_cast<float>(src_w) / viewport_w, static_cast<float>(src_h) / viewport_h);
-			viewport_w = static_cast<int>(viewport_w * s);
-			viewport_h = static_cast<int>(viewport_h * s);
-		}
-		int viewport_x = renderAreaX + (renderAreaW - viewport_w) / 2;
-		int viewport_y = glAreaY + (renderAreaH - viewport_h) / 2;
-
 		// Set viewport for shader rendering
-		glViewport(viewport_x, viewport_y, viewport_w, viewport_h);
+		glViewport(shader_viewport_x, shader_viewport_y,
+			shader_viewport_w, shader_viewport_h);
 
 		if (is_cropped && surface) {
 			uae_u8* crop_ptr = static_cast<uae_u8*>(surface->pixels) + (crop_y * surface->pitch) + (crop_x * m_gl_format.bpp);
 
 			render_external_shader(m_shader.external, monid, crop_ptr,
-				crop_w, crop_h, surface->pitch, viewport_x, viewport_y, viewport_w, viewport_h);
+				crop_w, crop_h, surface->pitch,
+				shader_viewport_x, shader_viewport_y, shader_viewport_w, shader_viewport_h,
+				shader_framebuffer);
 		} else if (surface) {
 			render_external_shader(m_shader.external, monid,
 				static_cast<const uae_u8*>(surface->pixels),
-				surface->w, surface->h, surface->pitch, viewport_x, viewport_y, viewport_w, viewport_h);
+				surface->w, surface->h, surface->pitch,
+				shader_viewport_x, shader_viewport_y, shader_viewport_w, shader_viewport_h,
+				shader_framebuffer);
 		}
 
 	} else if (m_shader.crtemu) {
@@ -724,7 +848,11 @@ void OpenGLRenderer::present_frame(int monid, int mode)
 		} else if (surface) {
 			crtemu_present(m_shader.crtemu, time * 1000, (CRTEMU_U32 const*)surface->pixels,
 			surface->w, surface->h, surface->pitch, 0xffffffff, 0x000000, m_gl_format.fmt, m_gl_format.type, m_gl_format.bpp);
-        }
+		}
+	}
+
+	if (use_shader_resolve) {
+		render_shader_resolve(destX, glDestY, destW, destH);
 	}
 
 	render_software_cursor(monid, destX, glDestY, destW, destH);
@@ -756,7 +884,8 @@ static const float k_external_shader_quad[] = {
 
 void OpenGLRenderer::render_external_shader(ExternalShader* shader, const int monid,
 	const uae_u8* pixels, int width, int height, int pitch,
-	int viewport_x, int viewport_y, int viewport_width, int viewport_height)
+	int viewport_x, int viewport_y, int viewport_width, int viewport_height,
+	const GLuint target_framebuffer)
 {
 	if (!shader || !shader->is_valid() || !pixels) {
 		return;
@@ -847,7 +976,7 @@ void OpenGLRenderer::render_external_shader(ExternalShader* shader, const int mo
 	}
 
 	// --- Per-frame fast path -----------------------------------------------
-	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	glBindFramebuffer(GL_FRAMEBUFFER, target_framebuffer);
 	glViewport(viewport_x, viewport_y, viewport_width, viewport_height);
 
 	glActiveTexture(GL_TEXTURE0);
@@ -902,6 +1031,10 @@ void OpenGLRenderer::render_external_shader(ExternalShader* shader, const int mo
 
 void OpenGLRenderer::destroy_shaders()
 {
+	// Shared-window GUI entry must release the GL shader objects, but the
+	// parameter editor still needs their CPU-side metadata and current values.
+	cache_shader_parameters();
+
 	// Clear tracked name so next alloc_texture call will recreate
 	m_shader.loaded_name.clear();
 
@@ -913,6 +1046,10 @@ void OpenGLRenderer::destroy_shaders()
 		m_shader.external = nullptr;
 		m_shader.preset = nullptr;
 		m_shader.bezel_enabled = false;
+		m_shader.resolve_framebuffer = 0;
+		m_shader.resolve_texture = 0;
+		m_shader.resolve_width = 0;
+		m_shader.resolve_height = 0;
 		m_vsync.gl_initialized = false;
 		return;
 	}
@@ -932,6 +1069,7 @@ void OpenGLRenderer::destroy_shaders()
 		destroy_shader_preset(m_shader.preset);
 		m_shader.preset = nullptr;
 	}
+	destroy_shader_resolve_target();
 	m_shader.bezel_enabled = false;
 	if (m_overlay.osd_program != 0 && glIsProgram(m_overlay.osd_program))
 	{
@@ -997,13 +1135,66 @@ bool OpenGLRenderer::has_valid_shader() const
 
 bool OpenGLRenderer::has_shader_parameters() const
 {
-	if (m_shader.preset && m_shader.preset->is_valid() &&
-		!m_shader.preset->get_all_parameters().empty())
-		return true;
-	if (m_shader.external && m_shader.external->is_valid() &&
-		!m_shader.external->get_parameters().empty())
-		return true;
-	return false;
+	const bool rtg = AMonitors[0].screen_is_picasso;
+	return has_shader_parameters(get_selected_shader_name(&AMonitors[0]), rtg);
+}
+
+void OpenGLRenderer::cache_shader_parameter_template()
+{
+	const std::vector<ShaderParameter>* params = nullptr;
+	if (m_shader.preset && m_shader.preset->is_valid()) {
+		params = &m_shader.preset->get_all_parameters();
+	} else if (m_shader.external && m_shader.external->is_valid()) {
+		params = &m_shader.external->get_parameters();
+	}
+
+	if (params) {
+		m_shader.parameter_template.shader_name = m_shader.loaded_name;
+		m_shader.parameter_template.parameters = *params;
+	}
+}
+
+void OpenGLRenderer::cache_shader_parameters()
+{
+	const std::vector<ShaderParameter>* params = nullptr;
+	if (m_shader.preset && m_shader.preset->is_valid()) {
+		params = &m_shader.preset->get_all_parameters();
+	} else if (m_shader.external && m_shader.external->is_valid()) {
+		params = &m_shader.external->get_parameters();
+	}
+
+	if (params) {
+		auto& cache = m_shader.loaded_for_rtg
+			? m_shader.rtg_parameter_cache
+			: m_shader.native_parameter_cache;
+		cache.shader_name = m_shader.loaded_name;
+		cache.parameters = *params;
+	}
+}
+
+void OpenGLRenderer::restore_shader_parameters(const char* shader_name, const bool rtg)
+{
+	if (!shader_name)
+		return;
+
+	auto apply_parameter = [&](const std::string& name, const float value) {
+		if (m_shader.preset) {
+			m_shader.preset->set_parameter(name, value);
+		} else if (m_shader.external) {
+			m_shader.external->set_parameter(name, value);
+		}
+	};
+
+	for (const auto& parameter : amiberry_options.shader_parameters) {
+		if (parameter.rtg == rtg && parameter.shader == shader_name)
+			apply_parameter(parameter.name, parameter.value);
+	}
+
+	const auto& cache = rtg ? m_shader.rtg_parameter_cache : m_shader.native_parameter_cache;
+	if (cache.shader_name == shader_name) {
+		for (const auto& parameter : cache.parameters)
+			apply_parameter(parameter.name, parameter.current_value);
+	}
 }
 
 // --- Bezel overlay ---
@@ -1076,23 +1267,8 @@ void OpenGLRenderer::get_gfx_offset(int monid, float src_w, float src_h, float s
 
 void OpenGLRenderer::get_drawable_size(SDL_Window* w, int* width, int* height)
 {
-	if (is_kmsdrm_video_driver()) {
-		int win_w = 0, win_h = 0;
-		int pix_w = 0, pix_h = 0;
-		SDL_GetWindowSize(w, &win_w, &win_h);
-		SDL_GetWindowSizeInPixels(w, &pix_w, &pix_h);
-		if ((pix_w != 0 && pix_w != win_w) || (pix_h != 0 && pix_h != win_h)) {
-			static bool logged_kmsdrm_drawable_mismatch = false;
-			if (!logged_kmsdrm_drawable_mismatch) {
-				write_log("KMSDRM: using window size as drawable size (window=%dx%d pixels=%dx%d)\n",
-					win_w, win_h, pix_w, pix_h);
-				logged_kmsdrm_drawable_mismatch = true;
-			}
-		}
-		*width = win_w;
-		*height = win_h;
+	if (get_kmsdrm_drawable_size(w, width, height))
 		return;
-	}
 	SDL_GetWindowSizeInPixels(w, width, height);
 }
 
@@ -1119,6 +1295,7 @@ void OpenGLRenderer::restore_emulation_context(SDL_Window* window)
 		SDL_GL_MakeCurrent(window, m_gl_context);
 		reset_state();
 		m_vsync.current_interval = INVALID_SWAP_INTERVAL;
+		amiberry_hw_vsync_pacing_set_blocking(false);
 	}
 }
 
@@ -1642,10 +1819,8 @@ void OpenGLRenderer::render_vkbd(int monid)
 {
 	if (vkbd_allowed(monid) && imgui_osk_should_render())
 	{
-		int dw, dh;
-		get_drawable_size(AMonitors[monid].amiga_window, &dw, &dh);
 		imgui_overlay_begin_frame();
-		imgui_osk_render(dw, dh);
+		imgui_osk_render();
 		imgui_overlay_end_frame();
 	}
 }
@@ -1675,6 +1850,139 @@ ShaderState& OpenGLRenderer::shader_state()
 const ShaderState& OpenGLRenderer::shader_state() const
 {
 	return m_shader;
+}
+
+std::vector<ShaderParameter>* OpenGLRenderer::shader_parameters(const char* shader_name, const bool rtg)
+{
+	auto* params = const_cast<std::vector<ShaderParameter>*>(
+		static_cast<const OpenGLRenderer*>(this)->shader_parameters(shader_name, rtg));
+	if (params || !shader_name)
+		return params;
+
+	// The same shader can be configured independently for Native and RTG modes.
+	// Start with the values supplied by the shader/preset before target overrides.
+	const std::vector<ShaderParameter>* source = nullptr;
+	bool use_template_values = false;
+	if (m_shader.parameter_template.shader_name == shader_name) {
+		source = &m_shader.parameter_template.parameters;
+		use_template_values = true;
+	} else {
+		source = static_cast<const OpenGLRenderer*>(this)->shader_parameters(shader_name, !rtg);
+	}
+	if (!source)
+		return nullptr;
+
+	auto& cache = rtg ? m_shader.rtg_parameter_cache : m_shader.native_parameter_cache;
+	cache.shader_name = shader_name;
+	cache.parameters = *source;
+	for (auto& parameter : cache.parameters) {
+		if (!use_template_values)
+			parameter.current_value = parameter.default_value;
+		for (const auto& saved : amiberry_options.shader_parameters) {
+			if (saved.rtg == rtg && saved.shader == shader_name && saved.name == parameter.name) {
+				parameter.current_value = std::max(parameter.min_value,
+					std::min(parameter.max_value, saved.value));
+				break;
+			}
+		}
+	}
+	return &cache.parameters;
+}
+
+const std::vector<ShaderParameter>* OpenGLRenderer::shader_parameters(const char* shader_name, const bool rtg) const
+{
+	if (!shader_name)
+		return nullptr;
+
+	if (m_shader.loaded_name == shader_name && m_shader.loaded_for_rtg == rtg) {
+		if (m_shader.preset && m_shader.preset->is_valid())
+			return &m_shader.preset->get_all_parameters();
+		if (m_shader.external && m_shader.external->is_valid())
+			return &m_shader.external->get_parameters();
+	}
+
+	const auto& cache = rtg ? m_shader.rtg_parameter_cache : m_shader.native_parameter_cache;
+	if (cache.shader_name == shader_name)
+		return &cache.parameters;
+
+	return nullptr;
+}
+
+bool OpenGLRenderer::ensure_shader_parameters(const char* shader_name, const bool rtg)
+{
+	if (!shader_name)
+		return false;
+
+	// Reuse active, target-cached, template, or opposite-target metadata first.
+	if (shader_parameters(shader_name, rtg))
+		return true;
+
+	std::vector<ShaderParameter> parameters;
+	if (!load_shader_parameter_metadata(shader_name, parameters))
+		return false;
+
+	auto& cache = rtg ? m_shader.rtg_parameter_cache : m_shader.native_parameter_cache;
+	cache.shader_name = shader_name;
+	cache.parameters = std::move(parameters);
+	for (auto& parameter : cache.parameters) {
+		for (const auto& saved : amiberry_options.shader_parameters) {
+			if (saved.rtg == rtg && saved.shader == shader_name && saved.name == parameter.name) {
+				parameter.current_value = std::max(parameter.min_value,
+					std::min(parameter.max_value, saved.value));
+				break;
+			}
+		}
+	}
+	return true;
+}
+
+bool OpenGLRenderer::has_shader_parameters(const char* shader_name, const bool rtg) const
+{
+	const auto* params = shader_parameters(shader_name, rtg);
+	return params && !params->empty();
+}
+
+bool OpenGLRenderer::set_shader_parameter(const char* shader_name, const bool rtg,
+	const std::string& name, const float value)
+{
+	bool updated = false;
+	if (shader_name && m_shader.loaded_name == shader_name && m_shader.loaded_for_rtg == rtg) {
+		if (m_shader.preset && m_shader.preset->is_valid())
+			updated = m_shader.preset->set_parameter(name, value) || updated;
+		else if (m_shader.external && m_shader.external->is_valid())
+			updated = m_shader.external->set_parameter(name, value) || updated;
+	}
+
+	auto& cache = rtg ? m_shader.rtg_parameter_cache : m_shader.native_parameter_cache;
+	if (shader_name && cache.shader_name == shader_name) {
+		for (auto& param : cache.parameters) {
+			if (param.name == name) {
+				param.current_value = std::max(param.min_value, std::min(param.max_value, value));
+				updated = true;
+				break;
+			}
+		}
+	}
+
+	return updated;
+}
+
+void OpenGLRenderer::save_shader_parameters(const char* shader_name, const bool rtg)
+{
+	const auto* params = shader_parameters(shader_name, rtg);
+	if (!params || !shader_name)
+		return;
+
+	auto& saved = amiberry_options.shader_parameters;
+	saved.erase(std::remove_if(saved.begin(), saved.end(),
+		[&](const amiberry_shader_parameter& parameter) {
+			return parameter.rtg == rtg && parameter.shader == shader_name;
+		}), saved.end());
+
+	for (const auto& parameter : *params) {
+		if (parameter.current_value != parameter.default_value)
+			saved.push_back({rtg, shader_name, parameter.name, parameter.current_value});
+	}
 }
 
 GLOverlayState& OpenGLRenderer::overlay_state()

@@ -55,6 +55,7 @@ set(SOURCE_FILES
         src/softfloat/softfloat_decimal.cpp
         src/softfloat/softfloat_fpsp.cpp
         src/framebufferboards.cpp
+        src/zz9000.cpp
         src/fsdb.cpp
         src/fsusage.cpp
         src/gayle.cpp
@@ -252,6 +253,8 @@ set(SOURCE_FILES
         src/osdep/amiberry_update.cpp
         src/osdep/amiberry_uaenet.cpp
         src/osdep/amiberry_whdbooter.cpp
+        src/osdep/amiberry_rp9.cpp
+        src/osdep/rp9_manifest.cpp
         src/osdep/blkdev_ioctl.cpp
         src/osdep/ioport.cpp
         src/osdep/sigsegv_handler.cpp
@@ -365,6 +368,7 @@ set(IMGUI_GUI_FILES
 		src/osdep/imgui/rom.cpp
 		src/osdep/imgui/rtg.cpp
 		src/osdep/imgui/savestates.cpp
+		src/osdep/imgui/shader_catalog.cpp
 		src/osdep/imgui/sound.cpp
 		src/osdep/imgui/themes.cpp
 		src/osdep/imgui/virtualkeyboard.cpp

@@ -31,9 +31,8 @@
 #include "zfile.h"
 #include "zarchive.h"
 
-extern void set_last_active_config(const char* filename);
+extern void set_last_active_config_from_media(const char* filename);
 extern std::string current_dir;
-extern char last_loaded_config[MAX_DPATH];
 
 // Use configs with 8MB Fast RAM, to make it likely
 // that WHDLoad preload will cache everything.
@@ -387,7 +386,6 @@ void symlink_roms(struct uae_prefs* prefs)
 
 std::string get_game_filename(const char* filepath)
 {
-	extract_filename(filepath, last_loaded_config);
 	const std::string game_name = extract_filename(filepath);
 	return remove_file_extension(game_name);
 }
@@ -428,6 +426,7 @@ void cd_auto_prefs(uae_prefs* prefs, char* filepath)
 	TCHAR tmp[MAX_DPATH];
 
 	write_log("\nCD Autoload: %s  \n\n", filepath);
+	set_last_active_config_from_media(filepath);
 
 	conf_path = get_configuration_path();
 	whdload_prefs.filename = get_game_filename(filepath);
@@ -1501,11 +1500,12 @@ void create_startup_sequence()
 	// SPLASH
 	if (!whdload_prefs.show_splash)
 	{
-		whd_bootscript << " SPLASHDELAY=0";
+		// Slaves with configurable options still show the startup window unless both delays are zero.
+		whd_bootscript << " SPLASHDELAY=0 CONFIGDELAY=0";
 	}
 
 	// CONFIGDELAY
-	if (whdload_prefs.config_delay != 0)
+	if (whdload_prefs.show_splash && whdload_prefs.config_delay != 0)
 	{
 		whd_bootscript << " CONFIGDELAY=" << whdload_prefs.config_delay;
 	}
@@ -1602,8 +1602,11 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 #ifdef __ANDROID__
 	const bool android_onscreen_joystick = prefs->onscreen_joystick;
 	const bool android_vkbd_enabled = prefs->vkbd_enabled;
+	const bool android_vkbd_numpad = prefs->vkbd_numpad;
 	const bool android_input_default_osk = prefs->input_default_onscreen_keyboard;
 #endif
+
+	set_last_active_config_from_media(filepath);
 
 	config_loaded = false;
 
@@ -1826,6 +1829,7 @@ void whdload_auto_prefs(uae_prefs* prefs, const char* filepath, const bool prese
 	// Preserve the launcher's explicit choice across the WHDLoad hardware preset.
 	prefs->onscreen_joystick = android_onscreen_joystick;
 	prefs->vkbd_enabled = android_vkbd_enabled;
+	prefs->vkbd_numpad = android_vkbd_numpad;
 	prefs->input_default_onscreen_keyboard = android_input_default_osk;
 #endif
 

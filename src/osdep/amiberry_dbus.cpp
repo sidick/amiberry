@@ -277,6 +277,7 @@ static void HandleInsertFloppy(DBusMessage* msg)
 		{
 			_tcsncpy(changed_prefs.floppyslots[drivenum].df, diskpathstr, MAX_DPATH);
 			changed_prefs.floppyslots[drivenum].df[MAX_DPATH - 1] = 0;
+			set_last_active_config_from_media(diskpathstr);
 			set_config_changed();
 		}
 		else
@@ -311,6 +312,7 @@ static void HandleInsertCD(DBusMessage* msg)
 		_tcsncpy(changed_prefs.cdslots[0].name, diskpathstr, MAX_DPATH);
 		changed_prefs.cdslots[0].name[MAX_DPATH - 1] = 0;
 		changed_prefs.cdslots[0].inuse = true;
+		set_last_active_config_from_media(diskpathstr);
 
 		std::cout << "CD Type: " << changed_prefs.cdslots[0].type << "\n";
 		set_config_changed();
@@ -446,7 +448,7 @@ static void HandleSetConfig(DBusMessage* msg)
 		// Display options
 		else if (strcmp(optname, "gfx_fullscreen") == 0) {
 			bool fullscreen = (strcmp(optval, "true") == 0 || strcmp(optval, "1") == 0);
-			changed_prefs.gfx_apmode[0].gfx_fullscreen = fullscreen ? GFX_FULLSCREEN : GFX_WINDOW;
+			changed_prefs.gfx_apmode[0].gfx_fullscreen = fullscreen ? GFX_FULLWINDOW : GFX_WINDOW;
 			set_config_changed();
 		}
 		// Sound options
