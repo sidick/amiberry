@@ -19,7 +19,7 @@ if (USE_DBUS)
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(DBUS REQUIRED dbus-1)
     target_include_directories(${PROJECT_NAME} PRIVATE ${DBUS_INCLUDE_DIRS})
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${DBUS_LIBRARIES})
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${DBUS_LINK_LIBRARIES})
 endif ()
 
 if (USE_IPC_SOCKET)
@@ -43,6 +43,17 @@ if (USE_OPENGL)
         else()
             find_package(OpenGL REQUIRED)
             target_link_libraries(${PROJECT_NAME} PRIVATE OpenGL::GL)
+            if(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+                # ES fallback tier (context ladder modes 4/5 in gfx_window.cpp):
+                # last-resort GLES 3.0 context for hosts whose only hardware
+                # driver is GLES. No extra link-time dependency — SDL loads
+                # libGLESv2 via EGL and glvnd dispatches our direct GL entry
+                # calls to the current context. Linux/FreeBSD only: Windows/
+                # macOS have no GLES driver story (ANGLE breaks opengl32
+                # stub dispatch).
+                target_compile_definitions(${PROJECT_NAME} PRIVATE AMIBERRY_GLES_FALLBACK)
+                message(STATUS "OpenGL ES fallback tier enabled (GLES 3.0 context retry on desktop GL failure)")
+            endif()
         endif()
     else()
         target_link_libraries(${PROJECT_NAME} PRIVATE GLESv3 EGL)
@@ -94,12 +105,12 @@ if(ANDROID)
     FetchContent_Declare(
         sdl3
         GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
-        GIT_TAG        release-3.4.14
+        GIT_TAG        release-3.4.16
     )
     FetchContent_Declare(
         sdl3_image
         GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
-        GIT_TAG        release-3.4.4
+        GIT_TAG        release-3.4.6
     )
     set(SDLIMAGE_AVIF OFF CACHE BOOL "Disable AVIF support in Android vendored SDL_image" FORCE)
     set(SDLIMAGE_PNG_LIBPNG OFF CACHE BOOL "Use SDL's PNG helpers instead of SDL_image's vendored libpng on Android" FORCE)
@@ -782,7 +793,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 elseif(CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
     find_library(UTIL_LIBRARY util REQUIRED)
     # REQUIRED will make sure the build fails earlier if libutil isn't found
-    target_link_libraries(${PROJECT_NAME} PRIVATE ${UTIL_LIBRARY} iconv)
+    find_library(ICONV_LIB iconv PATHS /usr/local/lib REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${UTIL_LIBRARY} ${ICONV_LIB})
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Haiku")
     target_link_libraries(${PROJECT_NAME} PRIVATE network iconv bsd)
 endif()

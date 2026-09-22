@@ -1237,6 +1237,7 @@ extern struct uae_prefs* cfgfile_open(const TCHAR* filename, int* type);
 extern void cfgfile_close(struct uae_prefs* p);
 extern int cfgfile_load(struct uae_prefs* p, const TCHAR* filename, int* type, int ignorelink, int userconfig);
 extern int cfgfile_save(struct uae_prefs* p, const TCHAR* filename, int);
+extern int cfgfile_dump_config(struct uae_prefs* p, int type);
 extern void cfgfile_parse_line(struct uae_prefs* p, TCHAR*, int);
 extern void cfgfile_parse_lines(struct uae_prefs* p, const TCHAR*, int);
 extern int cfgfile_parse_option(struct uae_prefs* p, const TCHAR* option, TCHAR* value, int);
@@ -1265,6 +1266,7 @@ extern void cfgfile_get_shader_config(struct uae_prefs* p, int rtg);
 
 #ifdef AMIBERRY
 extern void whdload_auto_prefs(struct uae_prefs* prefs, const char* filepath, bool preserve_quickstart_hardware = false);
+extern void whdload_set_host_writes_enabled(bool enabled);
 extern void cd_auto_prefs(struct uae_prefs* prefs, char* filepath);
 extern void symlink_roms(struct uae_prefs* prefs);
 extern void drawbridge_update_profiles(struct uae_prefs* prefs);
@@ -1394,6 +1396,15 @@ struct amiberry_options
 	bool gui_joystick_control = true;
 	int default_line_mode = 1;
 	int input_default_mouse_speed = 100;
+
+	// GUI scale as a percentage of the automatic DPI-aware layout scale
+	// (100 = stock behavior). Android defaults smaller so large Chromebook
+	// panels render the GUI near the ChromeOS fork's tuned size.
+#ifdef __ANDROID__
+	float gui_layout_scale_percent = 70.0f;
+#else
+	float gui_layout_scale_percent = 100.0f;
+#endif
 	bool input_keyboard_as_joystick_stop_keypresses = false;
 	char default_open_gui_key[128] = "F12";
 	char default_quit_key[128]{};
@@ -1444,9 +1455,17 @@ struct amiberry_options
 	bool default_onscreen_joystick = false;
 	bool default_vkbd_enabled = false;
 #endif
-	char default_vkbd_language[128] = "US";
-	int default_vkbd_transparency;
-	char default_vkbd_toggle[128] = "guide";
+char default_vkbd_language[128] = "US";
+int default_vkbd_transparency;
+#ifdef __ANDROID__
+// Guide is intercepted as the menu trigger on Android (see
+// handle_controller_button_event), so the on-screen keyboard toggle
+// needs a different default button there.
+char default_vkbd_toggle[128] = "leftstick";
+#else
+char default_vkbd_toggle[128] = "guide";
+#endif
+	bool default_vkbd_toggle_migrated = false;
 	char gui_theme[128] = "Default.theme";
 	char shader[128] = "none";
 	char shader_rtg[128] = "none";

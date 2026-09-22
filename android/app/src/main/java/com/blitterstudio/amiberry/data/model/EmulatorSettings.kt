@@ -69,7 +69,12 @@ data class EmulatorSettings(
 	val joyport1: String = "onscreen_joy",
 	val onScreenJoystick: Boolean = true,
 	val onScreenKeyboard: Boolean = true,
-	val onScreenKeyboardNumpad: Boolean = false
+	val onScreenKeyboardNumpad: Boolean = false,
+	/** SDL gamepad button name that toggles the on-screen keyboard (vkbd_toggle).
+	 * null = key absent, emulator default applies; "" = explicitly disabled; else a button name. */
+	val onScreenKeyboardToggle: String? = null,
+	val joyport0MouseMap: Boolean = false,  // left analog stick + shoulders act as the Amiga mouse
+	val joyport1MouseMap: Boolean = false
 ) {
 	companion object {
 		/** Create settings from an AmigaModel with sensible defaults. */

@@ -12,6 +12,7 @@
 #include "registry.h"
 #include "target.h"
 #include "gui/gui_handling.h"
+#include "gui_layout_scale.h"
 #include "shader_catalog.h"
 
 namespace {
@@ -69,6 +70,21 @@ static bool render_int_row(const char* label, int* value, const char* help,
 	if (changed)
 		*value = std::clamp(*value, min_value, max_value);
 	finish_setting_row(help);
+	return changed;
+}
+
+// GUI-scale row: the option is a float percent, but the row edits an integer
+// percent spinner clamped to the range from gui_layout_scale.h — the minimum
+// doubles as the lockout guarantee, so the settings UI can never be scaled
+// below readable.
+static bool render_gui_scale_row(const char* label, float* value, const char* help)
+{
+	int percent = static_cast<int>(clamp_gui_layout_scale_percent(*value));
+	const bool changed = render_int_row(label, &percent, help, 1,
+		static_cast<int>(gui_layout_scale_min_percent),
+		static_cast<int>(gui_layout_scale_max_percent));
+	if (changed)
+		*value = clamp_gui_layout_scale_percent(static_cast<float>(percent));
 	return changed;
 }
 
@@ -372,6 +388,10 @@ static void save_global_settings()
 	const bool conf_ok = save_amiberry_settings_with_result();
 	regclosetree(nullptr);
 
+	// A saved GUI-scale preference applies on the next GUI open; see
+	// invalidate_gui_window_size_init().
+	invalidate_gui_window_size_init();
+
 	if (conf_ok && ini_ok) {
 		ShowMessageBox("Global Settings", "Global settings saved.");
 	} else if (!conf_ok && !ini_ok) {
@@ -499,22 +519,23 @@ void render_panel_global_settings()
 			"Enable RetroArch-style reset button mapping by default when a mapping exists.");
 		render_input_device_row("Controller 1", amiberry_options.default_controller1,
 			sizeof amiberry_options.default_controller1,
-			"Default controller mapping for port 1.");
+			"Default device for Input Port 2 (joystick) in new configurations and autobooted content. "
+			"Does not change the current configuration; use the Input panel for that.");
 		render_input_device_row("Controller 2", amiberry_options.default_controller2,
 			sizeof amiberry_options.default_controller2,
-			"Default controller mapping for port 2.");
+			"Second controller, used on Input Port 1 by WHDLoad/CD32 autoboot.");
 		render_input_device_row("Controller 3", amiberry_options.default_controller3,
 			sizeof amiberry_options.default_controller3,
-			"Default controller mapping for port 3.");
+			"Default device for Input Port 3 (parallel joystick) in new configurations and WHDLoad autoboot.");
 		render_input_device_row("Controller 4", amiberry_options.default_controller4,
 			sizeof amiberry_options.default_controller4,
-			"Default controller mapping for port 4.");
+			"Default device for Input Port 4 (parallel joystick) in new configurations and WHDLoad autoboot.");
 		render_input_device_row("Mouse 1", amiberry_options.default_mouse1,
 			sizeof amiberry_options.default_mouse1,
-			"Default mouse mapping for mouse port 1.");
+			"Default device for Input Port 1 (mouse) in new configurations and mouse-controlled autobooted content.");
 		render_input_device_row("Mouse 2", amiberry_options.default_mouse2,
 			sizeof amiberry_options.default_mouse2,
-			"Default mouse mapping for mouse port 2.");
+			"Second mouse device, used on Input Port 2 for mouse-controlled WHDLoad content.");
 	});
 
 	render_group("Display defaults", "GlobalDisplayDefaults", [&]() {
@@ -546,6 +567,8 @@ void render_panel_global_settings()
 		render_combo_row("Screen mode", &amiberry_options.default_fullscreen_mode,
 			fullscreen_options, IM_ARRAYSIZE(fullscreen_options),
 			"Default native and RTG screen mode.");
+		render_gui_scale_row("GUI scale", &amiberry_options.gui_layout_scale_percent,
+			"Size of the GUI as a percentage of automatic DPI scaling. 100 is the default.");
 	});
 
 	render_group("Sound defaults", "GlobalSoundDefaults", [&]() {

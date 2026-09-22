@@ -25,6 +25,53 @@ class ConfigGeneratorTest {
 	}
 
 	@Test
+	fun `generate writes vkbd toggle when set`() {
+		val output = ConfigGenerator.generate(
+			EmulatorSettings(onScreenKeyboard = true, onScreenKeyboardToggle = "rightstick")
+		)
+		assertContains(output, "amiberry.vkbd_toggle=rightstick")
+	}
+
+	@Test
+	fun `generated explicitly empty vkbd toggle parses back as disabled`() {
+		val file = tempDir.newFile("disabled-toggle.uae")
+		file.writeText(
+			ConfigGenerator.generate(
+				EmulatorSettings(onScreenKeyboard = true, onScreenKeyboardToggle = "")
+			)
+		)
+
+		assertEquals("", ConfigParser.parse(file).settings.onScreenKeyboardToggle)
+	}
+
+	@Test
+	fun `saved default toggle survives remembered fallback on reload`() {
+		val file = tempDir.newFile("default-toggle.uae")
+		val settings = EmulatorSettings(onScreenKeyboard = true, onScreenKeyboardToggle = null)
+		for (generated in listOf(ConfigGenerator.generate(settings), ConfigGenerator.generateControlConfig(settings))) {
+			file.writeText(generated)
+			val parsed = ConfigParser.parse(file)
+			val reloaded = AndroidControlSettings.withFallback(
+				settings = parsed.settings,
+				explicitKeys = parsed.explicitKeys,
+				fallback = EmulatorSettings(onScreenKeyboardToggle = "rightstick")
+			)
+			assertNull(reloaded.onScreenKeyboardToggle)
+		}
+
+		// A legacy config written before the key existed must keep falling back
+		// to the remembered toggle.
+		file.writeText("amiberry.vkbd_enabled=true")
+		val legacyParsed = ConfigParser.parse(file)
+		val legacy = AndroidControlSettings.withFallback(
+			settings = legacyParsed.settings,
+			explicitKeys = legacyParsed.explicitKeys,
+			fallback = EmulatorSettings(onScreenKeyboardToggle = "rightstick")
+		)
+		assertEquals("rightstick", legacy.onScreenKeyboardToggle)
+	}
+
+	@Test
 	fun `generate includes CPU settings`() {
 		val output = ConfigGenerator.generate(EmulatorSettings(cpuModel = 68020))
 		assertContains(output, "cpu_model=68020")
@@ -163,6 +210,29 @@ class ConfigGeneratorTest {
 		val output = ConfigGenerator.generate(EmulatorSettings(joyport1 = "joy0"))
 		assertContains(output, "joyport1=joy0")
 		assertContains(output, "amiberry.android_joyport1=joy0")
+	}
+
+	@Test
+	fun `generate writes mouse map state explicitly for both ports`() {
+		val enabled = ConfigGenerator.generate(
+			EmulatorSettings(joyport0 = "joy0", joyport1 = "joy1", joyport0MouseMap = true, joyport1MouseMap = true)
+		)
+		assertContainsLine(enabled.lines(), "joyport0mousemap=1")
+		assertContainsLine(enabled.lines(), "joyport1mousemap=1")
+
+		val disabled = ConfigGenerator.generate(EmulatorSettings(joyport0 = "mouse", joyport1 = "joy0"))
+		assertContainsLine(disabled.lines(), "joyport0mousemap=0")
+		assertContainsLine(disabled.lines(), "joyport1mousemap=0")
+	}
+
+	@Test
+	fun `control config writes mouse map state explicitly`() {
+		val output = ConfigGenerator.generateControlConfig(
+			EmulatorSettings(joyport0 = "mouse", joyport1 = "joy0", joyport1MouseMap = true)
+		)
+
+		assertContainsLine(output.lines(), "joyport0mousemap=0")
+		assertContainsLine(output.lines(), "joyport1mousemap=1")
 	}
 
 	@Test
@@ -380,7 +450,8 @@ class ConfigGeneratorTest {
 			joyport1 = "joy0",
 			onScreenJoystick = false,
 			onScreenKeyboard = true,
-			onScreenKeyboardNumpad = true
+			onScreenKeyboardNumpad = true,
+			joyport1MouseMap = true
 		)
 
 		val configText = ConfigGenerator.generate(original)
@@ -415,8 +486,9 @@ class ConfigGeneratorTest {
 		assertEquals(original.joyport0, result.joyport0)
 		assertEquals(original.joyport1, result.joyport1)
 		assertEquals(original.onScreenJoystick, result.onScreenJoystick)
-		assertEquals(original.onScreenKeyboard, result.onScreenKeyboard)
 		assertEquals(original.onScreenKeyboardNumpad, result.onScreenKeyboardNumpad)
+		assertFalse(result.joyport0MouseMap)
+		assertTrue(result.joyport1MouseMap)
 	}
 
 	@Test

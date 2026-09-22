@@ -212,9 +212,19 @@ extern "C" off_t posixemu_seek(int fd, off_t offset, int whence)
 	retro_vfs_file_handle* handle = vfs_get_fd(fd);
 	if (handle) {
 		const struct retro_vfs_interface* vfs = libretro_get_vfs_interface();
-		if (vfs && vfs->seek) {
-			const int64_t ret = vfs->seek(handle, offset, vfs_whence(whence));
-			return ret < 0 ? static_cast<off_t>(-1) : static_cast<off_t>(ret);
+		if (vfs && vfs->seek && vfs->tell) {
+			/* The libretro VFS seek callback returns a status (0 on success),
+			 * not the resulting position, so query it via tell(). */
+			if (vfs->seek(handle, offset, vfs_whence(whence)) < 0) {
+				errno = ESPIPE;
+				return static_cast<off_t>(-1);
+			}
+			const int64_t position = vfs->tell(handle);
+			if (position < 0) {
+				errno = ESPIPE;
+				return static_cast<off_t>(-1);
+			}
+			return static_cast<off_t>(position);
 		}
 		errno = ESPIPE;
 		return static_cast<off_t>(-1);
@@ -250,7 +260,10 @@ extern "C" int posixemu_stat(const TCHAR* path, STAT* st)
 	char* fs_path = to_fs_path(path);
 	if (!fs_path)
 		return -1;
-	const int ret = ::stat(fs_path, st);
+	/* Call the real stat() through the helper sysdeps.h captured before
+	   its stat() macro shadowed the CRT one. The buffer type matches the
+	   toolchain's own struct stat on every target, so no _stat64 here. */
+	const int ret = uae_native_stat(fs_path, st);
 	free(fs_path);
 	return ret;
 }

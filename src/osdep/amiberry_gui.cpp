@@ -32,6 +32,7 @@
 #include "blkdev.h"
 #include "memory.h"
 #include "amiberry_gfx.h"
+#include "expansion_display_name.h"
 #include "irenderer.h"
 #ifdef ARCADIA
 #include "arcadia.h"
@@ -219,7 +220,7 @@ static int isromext(const std::string& path, bool deepscan)
 		return 0;
 	const std::string ext = path.substr(ext_pos + 1);
 
-	static const std::vector<std::string> extensions = { "rom", "bin", "a500", "a600", "a1200", "a3000", "a4000", "cdtv", "cd32", "roz" };
+	static const std::vector<std::string> extensions = { "rom", "bin", "a1000", "a500", "a600", "a1200", "a3000", "a4000", "cdtv", "cd32", "roz" };
 	for (const auto& extension : extensions)
 	{
 		if (strcasecmp(ext.c_str(), extension.c_str()) == 0)
@@ -1603,12 +1604,13 @@ void new_harddrive(int entry)
 void addhdcontroller(const struct expansionromtype* erc, int firstid, int flags)
 {
 	TCHAR name[MAX_DPATH];
+	const TCHAR* display_name = expansion_display_name(erc->friendlyname, erc->friendlymanufacturer);
 	name[0] = 0;
-	if (erc->friendlymanufacturer && _tcsicmp(erc->friendlymanufacturer, erc->friendlyname)) {
+	if (erc->friendlymanufacturer && _tcsicmp(erc->friendlymanufacturer, display_name)) {
 		_tcscat(name, erc->friendlymanufacturer);
 		_tcscat(name, _T(" "));
 	}
-	_tcscat(name, erc->friendlyname);
+	_tcscat(name, display_name);
 	if (changed_prefs.cpuboard_type && erc->romtype == ROMTYPE_CPUBOARD) {
 		const struct cpuboardsubtype* cbt = &cpuboards[changed_prefs.cpuboard_type].subtypes[changed_prefs.cpuboard_subtype];
 		if (!(cbt->deviceflags & flags))

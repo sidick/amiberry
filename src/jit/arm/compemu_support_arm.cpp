@@ -60,6 +60,7 @@
 #include "newcpu.h"
 #include "comptbl_arm.h"
 #include "compemu_arm.h"
+#include "jit/jit_trap_policy.h"
 #include <SDL3/SDL.h>
 
 /* ARM64 JIT is PIE-compatible: it uses register-indirect addressing
@@ -3498,6 +3499,19 @@ static inline unsigned int get_opcode_cft_map(unsigned int f)
 }
 #define DO_GET_OPCODE(a) (get_opcode_cft_map((uae_u16)*(a)))
 
+#if defined(CPU_AARCH64)
+/* Which fl_trap opcodes force whole-block interpretation. The policy itself
+ * lives in src/jit/jit_trap_policy.h, where tests/jit_trap_policy_test.cpp can
+ * assert it without building the emulator; that header documents why each
+ * group demotes or does not. */
+static bool jit_trap_demote_opcode(uae_u32 op)
+{
+    /* op is already the true opcode (DO_GET_OPCODE mapped it once); a
+     * second get_opcode_cft_map() would index junk. See #2315. */
+    return jit_trap_demote_mnemo(table68k[op].mnemo);
+}
+#endif
+
 void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 {
     if (cache_enabled && compiled_code && currprefs.cpu_model >= 68020) {
@@ -3515,6 +3529,7 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         bool trace_in_rom = isinrom((uintptr)pc_hist[0].location) != 0;
 #if defined(CPU_AARCH64)
         bool ram_trap_block = false;
+        bool ram_trap_any = false;
 #endif
         uintptr max_pcp = (uintptr)pc_hist[blocklen - 1].location;
         uintptr min_pcp = max_pcp;
@@ -3611,8 +3626,11 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
 #endif
             trace_in_rom = trace_in_rom && isinrom((uintptr)currpcp);
 #if defined(CPU_AARCH64)
-            if ((prop[op].cflow & fl_trap) && !isinrom((uintptr)currpcp))
-                ram_trap_block = true;
+            if ((prop[op].cflow & fl_trap) && !isinrom((uintptr)currpcp)) {
+                ram_trap_any = true;
+                if (jit_trap_demote_opcode(op))
+                    ram_trap_block = true;
+            }
 #endif
             if (follow_const_jumps && is_const_jump(op)) {
                 checksum_info* csi = alloc_checksum_info();
@@ -3644,10 +3662,19 @@ void compile_block(cpu_history* pc_hist, int blocklen, int totcycles)
         bi->needed_flags = liveflags[0];
 
 #if defined(CPU_AARCH64)
-        if (ram_trap_block) {
-            /* RAM test code can rewrite branch targets around fallback/trap opcodes
-             * before active compiled blocks are invalidated. Interpret these blocks
-             * so exception frames use the current instruction PC. */
+        if (ram_trap_block || (currprefs.cputester && ram_trap_any)) {
+            /* RAM test code can rewrite branch targets around fallback/trap
+             * opcodes before active compiled blocks are invalidated; and
+             * mixing interpreted trap/fallback opcodes with compiled flag
+             * readers inside one block can expose stale lazy-flag state.
+             * Interpret blocks carrying structural/supervisor trap opcodes
+             * (and, under the CPU tester, every trap-bearing block) so
+             * exception frames and flag capture use current state.
+             *
+             * Blocks whose only trap opcodes are hot user-mode arithmetic
+             * ones (DIVU/DIVS/DIVL, CHK) stay compiled: the opcode runs via
+             * the per-opcode fallback, which syncs the 68k PC before the
+             * interpreter handler call (#2299). */
             optlev = 0;
             bi->optlevel = optlev;
             bi->count = -1;

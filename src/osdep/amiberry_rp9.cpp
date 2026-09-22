@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -50,6 +51,13 @@ std::string loaded_snapshot_path;
 bool loaded_has_clip;
 std::vector<std::filesystem::path> temporary_directories;
 std::vector<std::string> loaded_floppy_paths;
+
+// Diagnostic early-exit modes (--dump-config) resolve RP9 packages without
+// deploying media into the persistent Shared tree: the extracted temporary
+// copy is used instead and removed with the rest of the temporary state.
+bool rp9_host_writes_suppressed = false;
+
+
 std::vector<std::string> loaded_cd_paths;
 std::atomic<unsigned long long> directory_sequence { 0 };
 
@@ -706,12 +714,18 @@ std::filesystem::path resolve_media_path(const rp9::Media& media,
 		const auto found = files.find(lowercase(normalized));
 		if (found == files.end())
 			return {};
+		if (rp9_host_writes_suppressed)
+			// Diagnostic modes resolve without deploying: point at the
+			// extracted copy, which the caller's cleanup removes together
+			// with the rest of the temporary tree.
+			return found->second;
 
 		std::filesystem::create_directories(destination.parent_path(), error);
 		if (error) {
 			set_error("Could not create the RP9 deployed-media directory: " + error.message());
 			return {};
 		}
+
 
 		auto temporary = destination;
 		temporary += ".tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())
@@ -1291,6 +1305,11 @@ void rp9_init()
 	loaded_cd_paths.clear();
 }
 
+void rp9_set_host_writes_enabled(const bool enabled)
+{
+	rp9_host_writes_suppressed = !enabled;
+}
+
 void rp9_cleanup()
 {
 	std::error_code error;
@@ -1342,6 +1361,18 @@ int rp9_register_rom_directory(const char* directory)
 	const std::filesystem::path root(directory);
 	if (!std::filesystem::is_directory(root, error) || error)
 		return 0;
+
+#ifdef LIBRETRO
+	// The normal libretro scan already registers firmware from the shared
+	// system root using its non-recursive, Amiga-name-only policy. Do not
+	// bypass that policy with RP9's unrestricted directory scan.
+	if (const auto* system_dir = std::getenv("AMIBERRY_LIBRETRO_SYSTEM_DIR");
+		system_dir && system_dir[0]) {
+		std::error_code equivalent_error;
+		if (std::filesystem::equivalent(root, system_dir, equivalent_error))
+			return 0;
+	}
+#endif
 
 	std::vector<std::filesystem::path> candidates;
 	std::vector<std::filesystem::path> key_files;

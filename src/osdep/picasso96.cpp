@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <atomic>
 
 #include "uae.h"
 
@@ -63,6 +64,9 @@
 #include "gfx_colors.h"
 #include "gfx_window.h"
 #include "display_modes.h"
+#ifdef __ANDROID__
+#include "android_rtg_modes.h"
+#endif
 #endif
 #include "threaddep/thread.h"
 #include "memory.h"
@@ -100,15 +104,19 @@ static int picasso96_GCT = GCT_Unknown;
 static int picasso96_PCT = PCT_Unknown;
 
 #if defined(_WIN32) && !defined(AMIBERRY)
-int mman_GetWriteWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize, PVOID *lpAddresses, PULONG_PTR lpdwCount, PULONG lpdwGranularity);
+int mman_GetWriteWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize, PVOID *lpAddresses, PULONG_PTR lpdwCount, PULONG_PTR lpdwGranularity);
 void mman_ResetWatch (PVOID lpBaseAddress, SIZE_T dwRegionSize);
 #else
 static constexpr int DIRTY_PAGE_SHIFT = 12;
 static constexpr int DIRTY_PAGE_SIZE = 1 << DIRTY_PAGE_SHIFT;
-static bool* dirty_page_map[MAX_RTG_BOARDS];
+static std::atomic<bool>* dirty_page_map[MAX_RTG_BOARDS];
 static int dirty_page_map_size[MAX_RTG_BOARDS];
-static int min_dirty_page_index[MAX_RTG_BOARDS];
-static int max_dirty_page_index[MAX_RTG_BOARDS];
+// Dirty-page bounds packed into a single word, (min_page << 32) | (max_page + 1):
+// mark_dirty() runs in the CPU write handlers while picasso_getwritewatch()
+// drains from the RTG render thread, and a single word lets the drain claim
+// the whole range with one compare_exchange so a concurrent writer can never
+// have its freshly published range overwritten by a reset.
+static std::atomic<uae_u64> dirty_bounds[MAX_RTG_BOARDS];
 #endif
 
 static void picasso_flushpixels(int index, uae_u8 *src, int offset, bool render);
@@ -499,6 +507,26 @@ static int gwwbufsize[MAX_RTG_BOARDS], gwwpagesize[MAX_RTG_BOARDS], gwwpagemask[
 extern uae_u8 *natmem_offset;
 
 #if !defined(_WIN32) || defined(AMIBERRY)
+// Widen the published dirty range. Called from the CPU write handlers after
+// the page bits have been set.
+static void dirty_bounds_widen(int index, int start_page, int end_page)
+{
+	uae_u64 cur = dirty_bounds[index].load();
+	for (;;) {
+		const int cur_min = static_cast<int>(cur >> 32);
+		const int cur_max = static_cast<int32_t>(static_cast<uint32_t>(cur)) - 1;
+		const int new_min = start_page < cur_min ? start_page : cur_min;
+		const int new_max = end_page > cur_max ? end_page : cur_max;
+		if (new_min == cur_min && new_max == cur_max) {
+			return;
+		}
+		const uae_u64 next = (static_cast<uae_u64>(new_min) << 32) | static_cast<uae_u32>(new_max + 1);
+		if (dirty_bounds[index].compare_exchange_weak(cur, next)) {
+			return;
+		}
+	}
+}
+
 static void NOINLINE mark_dirty(int index, uae_u8* addr, int size)
 {
 	if (index < 0 || !dirty_page_map[index])
@@ -514,15 +542,19 @@ static void NOINLINE mark_dirty(int index, uae_u8* addr, int size)
 	if (start_page < 0) start_page = 0;
 	if (end_page >= dirty_page_map_size[index]) end_page = dirty_page_map_size[index] - 1;
 
-	if (start_page < min_dirty_page_index[index]) min_dirty_page_index[index] = start_page;
-	if (end_page > max_dirty_page_index[index]) max_dirty_page_index[index] = end_page;
-
-	if (start_page <= end_page) {
-		dirty_page_map[index][start_page] = true;
-		for (int i = start_page + 1; i <= end_page; ++i) {
-			dirty_page_map[index][i] = true;
-		}
+	if (start_page > end_page) {
+		return;
 	}
+	dirty_page_map[index][start_page].store(true, std::memory_order_relaxed);
+	for (int i = start_page + 1; i <= end_page; ++i) {
+		dirty_page_map[index][i].store(true, std::memory_order_relaxed);
+	}
+
+	// Publish the widened bounds only after the bits are set. The bounds are
+	// a single word so picasso_getwritewatch() can claim the whole range with
+	// one compare_exchange; two separate words would let a drain reset one
+	// half after a writer published, losing the range until a later write.
+	dirty_bounds_widen(index, start_page, end_page);
 }
 #endif
 
@@ -1719,154 +1751,211 @@ static void picasso_handle_hsync()
 #define BLT_SIZE 4
 #define BLT_MULT 1
 #define BLT_NAME BLIT_FALSE_32
+#define BLT_NAME_TRANS BLIT_FALSE_TRANS_32
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_32
+#define BLT_NAME_TRANS BLIT_NOR_TRANS_32
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_32
+#define BLT_NAME_TRANS BLIT_ONLYDST_TRANS_32
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_32
+#define BLT_NAME_TRANS BLIT_NOTSRC_TRANS_32
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_32
+#define BLT_NAME_TRANS BLIT_ONLYSRC_TRANS_32
 #define BLT_FUNC(s,d) *d = (*s) & ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_32
+#define BLT_NAME_TRANS BLIT_NOTDST_TRANS_32
 #define BLT_FUNC(s,d) *d = (~(*d)) & rgbmask
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_32
+#define BLT_NAME_TRANS BLIT_EOR_TRANS_32
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_32
+#define BLT_NAME_TRANS BLIT_NAND_TRANS_32
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_32
+#define BLT_NAME_TRANS BLIT_AND_TRANS_32
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_32
+#define BLT_NAME_TRANS BLIT_NEOR_TRANS_32
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_32
+#define BLT_NAME_TRANS BLIT_NOTONLYSRC_TRANS_32
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_32
+#define BLT_NAME_TRANS BLIT_NOTONLYDST_TRANS_32
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_32
+#define BLT_NAME_TRANS BLIT_OR_TRANS_32
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_32
+#define BLT_NAME_TRANS BLIT_TRUE_TRANS_32
 #ifdef AMIBERRY
 #define BLT_FUNC(s,d) memset(d, 0xff, sizeof (*d))
 #else
 #define BLT_FUNC(s,d) *d = 0xffffffff
 #endif
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_32
+#define BLT_NAME_TRANS BLIT_SWAP_TRANS_32
 #define BLT_FUNC(s,d) { uae_u16 tmp = *d ; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_32
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_32
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
 #define BLT_SIZE 3
 #define BLT_MULT 1
 #define BLT_NAME BLIT_FALSE_24
+#define BLT_NAME_TRANS BLIT_FALSE_TRANS_24
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_24
+#define BLT_NAME_TRANS BLIT_NOR_TRANS_24
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_24
+#define BLT_NAME_TRANS BLIT_ONLYDST_TRANS_24
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_24
+#define BLT_NAME_TRANS BLIT_NOTSRC_TRANS_24
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_24
+#define BLT_NAME_TRANS BLIT_ONLYSRC_TRANS_24
 #define BLT_FUNC(s,d) *d = (*s) & (~(*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_24
+#define BLT_NAME_TRANS BLIT_NOTDST_TRANS_24
 #define BLT_FUNC(s,d) *d = (~(*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_24
+#define BLT_NAME_TRANS BLIT_EOR_TRANS_24
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_24
+#define BLT_NAME_TRANS BLIT_NAND_TRANS_24
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_24
+#define BLT_NAME_TRANS BLIT_AND_TRANS_24
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_24
+#define BLT_NAME_TRANS BLIT_NEOR_TRANS_24
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_24
+#define BLT_NAME_TRANS BLIT_NOTONLYSRC_TRANS_24
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_24
+#define BLT_NAME_TRANS BLIT_NOTONLYDST_TRANS_24
 #define BLT_FUNC(s,d) *d = (~(*d)) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_24
+#define BLT_NAME_TRANS BLIT_OR_TRANS_24
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_24
+#define BLT_NAME_TRANS BLIT_TRUE_TRANS_24
 #define BLT_FUNC(s,d) *d = 0xffffffff
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_24
+#define BLT_NAME_TRANS BLIT_SWAP_TRANS_24
 #define BLT_FUNC(s,d) { uae_u32 tmp = *d; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_24
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_24
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
 #define BLT_SIZE 2
 #define BLT_MULT 2
 #define BLT_NAME BLIT_FALSE_16
+#define BLT_NAME_TRANS BLIT_FALSE_TRANS_16
 #define BLT_FUNC(s,d) *d = 0
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_16
+#define BLT_NAME_TRANS BLIT_NOR_TRANS_16
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_16
+#define BLT_NAME_TRANS BLIT_ONLYDST_TRANS_16
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_16
+#define BLT_NAME_TRANS BLIT_NOTSRC_TRANS_16
 #define BLT_FUNC(s,d) *d = ~(*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_16
+#define BLT_NAME_TRANS BLIT_ONLYSRC_TRANS_16
 #define BLT_FUNC(s,d) *d = (*s) & ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_16
+#define BLT_NAME_TRANS BLIT_NOTDST_TRANS_16
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_16
+#define BLT_NAME_TRANS BLIT_EOR_TRANS_16
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_16
+#define BLT_NAME_TRANS BLIT_NAND_TRANS_16
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_16
+#define BLT_NAME_TRANS BLIT_AND_TRANS_16
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_16
+#define BLT_NAME_TRANS BLIT_NEOR_TRANS_16
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_16
+#define BLT_NAME_TRANS BLIT_NOTONLYSRC_TRANS_16
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_16
+#define BLT_NAME_TRANS BLIT_NOTONLYDST_TRANS_16
 #define BLT_FUNC(s,d) *d = ((~(*d)) & rgbmask) | (*s)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_16
+#define BLT_NAME_TRANS BLIT_OR_TRANS_16
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_16
+#define BLT_NAME_TRANS BLIT_TRUE_TRANS_16
 #define BLT_FUNC(s,d) *d = 0xffff
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_16
+#define BLT_NAME_TRANS BLIT_SWAP_TRANS_16
 #define BLT_FUNC(s,d) { uae_u16 tmp = *d; *d = *s; *s = tmp; }
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
+#define BLT_NAME BLIT_SRC_16
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_16
+#define BLT_FUNC(s,d) *d = *s
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
@@ -1874,94 +1963,214 @@ static void picasso_handle_hsync()
 #define BLT_MULT 4
 #define BLT_NAME BLIT_FALSE_8
 #define BLT_NAME_MASK BLIT_FALSE_MASK_8
+#define BLT_NAME_TRANS BLIT_FALSE_TRANS_8
 #define BLT_FUNC(s,d) *d = 0
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((0) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOR_8
 #define BLT_NAME_MASK BLIT_NOR_MASK_8
+#define BLT_NAME_TRANS BLIT_NOR_TRANS_8
 #define BLT_FUNC(s,d) *d = ~((*s) | (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) | (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYDST_8
 #define BLT_NAME_MASK BLIT_ONLYDST_MASK_8
+#define BLT_NAME_TRANS BLIT_ONLYDST_TRANS_8
 #define BLT_FUNC(s,d) *d = (*d) & ~(*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*d) & ~(*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTSRC_8
 #define BLT_NAME_MASK BLIT_NOTSRC_MASK_8
+#define BLT_NAME_TRANS BLIT_NOTSRC_TRANS_8
 #define BLT_FUNC(s,d) *d = ~(*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_ONLYSRC_8
 #define BLT_NAME_MASK BLIT_ONLYSRC_MASK_8
+#define BLT_NAME_TRANS BLIT_ONLYSRC_TRANS_8
 #define BLT_FUNC(s,d) *d = (*s) & ~(*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) & ~(*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTDST_8
 #define BLT_NAME_MASK BLIT_NOTDST_MASK_8
+#define BLT_NAME_TRANS BLIT_NOTDST_TRANS_8
 #define BLT_FUNC(s,d) *d = ~(*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_EOR_8
 #define BLT_NAME_MASK BLIT_EOR_MASK_8
+#define BLT_NAME_TRANS BLIT_EOR_TRANS_8
 #define BLT_FUNC(s,d) *d = (*s) ^ (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) ^ (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NAND_8
 #define BLT_NAME_MASK BLIT_NAND_MASK_8
+#define BLT_NAME_TRANS BLIT_NAND_TRANS_8
 #define BLT_FUNC(s,d) *d = ~((*s) & (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) & (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_AND_8
 #define BLT_NAME_MASK BLIT_AND_MASK_8
+#define BLT_NAME_TRANS BLIT_AND_TRANS_8
 #define BLT_FUNC(s,d) *d = (*s) & (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) & (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NEOR_8
 #define BLT_NAME_MASK BLIT_NEOR_MASK_8
+#define BLT_NAME_TRANS BLIT_NEOR_TRANS_8
 #define BLT_FUNC(s,d) *d = ~((*s) ^ (*d))
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~((*s) ^ (*d))) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYSRC_8
 #define BLT_NAME_MASK BLIT_NOTONLYSRC_MASK_8
+#define BLT_NAME_TRANS BLIT_NOTONLYSRC_TRANS_8
 #define BLT_FUNC(s,d) *d = ~(*s) | (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*s) | (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SRC_8
 #define BLT_NAME_MASK BLIT_SRC_MASK_8
+#define BLT_NAME_TRANS BLIT_SRC_TRANS_8
 #define BLT_FUNC(s,d) *d = *s
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((*s) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_NOTONLYDST_8
 #define BLT_NAME_MASK BLIT_NOTONLYDST_MASK_8
+#define BLT_NAME_TRANS BLIT_NOTONLYDST_TRANS_8
 #define BLT_FUNC(s,d) *d = ~(*d) | (*s)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((~(*d) | (*s)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_OR_8
 #define BLT_NAME_MASK BLIT_OR_MASK_8
+#define BLT_NAME_TRANS BLIT_OR_TRANS_8
 #define BLT_FUNC(s,d) *d = (*s) | (*d)
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | (((*s) | (*d)) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_TRUE_8
 #define BLT_NAME_MASK BLIT_TRUE_MASK_8
+#define BLT_NAME_TRANS BLIT_TRUE_TRANS_8
 #define BLT_FUNC(s,d) *d = 0xff
 #define BLT_FUNC_MASK(s,d,mask) *d = ((*d) & ~mask) | ((0xff) & mask)
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #define BLT_NAME BLIT_SWAP_8
 #define BLT_NAME_MASK BLIT_SWAP_MASK_8
+#define BLT_NAME_TRANS BLIT_SWAP_TRANS_8
 #define BLT_FUNC(s,d) { uae_u8 tmp = *d; *d = *s; *s = tmp; }
 #define BLT_FUNC_MASK(s,d,mask) { uae_u8 tmp = *d; *d = ((*d) & ~mask) | ((*s) & mask); *s = ((*s) & ~mask) | ((tmp) & mask); }
-#include "p96_blit.cpp.in"
+#include "../p96_blit.cpp.in"
 #undef BLT_SIZE
 #undef BLT_MULT
 
 #define PARMS width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, rgbmask
 #define PARMSM width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, mask
+#define PARMST width, height, src, dst, ri->BytesPerRow, dstri->BytesPerRow, transparentcolor, rgbmask
 
 /*
 * Functions to perform an action on the frame-buffer
 */
-static void do_blitrect_frame_buffer (const struct RenderInfo *ri, const struct
+static void do_blitrect_frame_buffer_transparent(struct RenderInfo *ri, struct
+	RenderInfo *dstri, uae_u32 srcx, uae_u32 srcy,
+	uae_u32 dstx, uae_u32 dsty, uae_u32 width, uae_u32 height,
+	uae_u8 mask, uae_u32 transparentcolor, uae_u32 RGBFmt, BLIT_OPCODE opcode)
+{
+	uae_u8 Bpp = GetBytesPerPixel(RGBFmt);
+	uae_u32 total_width = width * Bpp;
+	uae_u32 rgbmask = rgbfmasks[RGBFmt];
+	endianswap(&transparentcolor, Bpp);
+
+	uae_u8 *src = ri->Memory + srcx * Bpp + srcy * ri->BytesPerRow;
+	uae_u8 *dst = dstri->Memory + dstx * Bpp + dsty * dstri->BytesPerRow;
+
+	P96TRACE((_T("(%dx%d)=(%dx%d)=(%dx%d)=%d\n"), srcx, srcy, dstx, dsty, width, height, opcode));
+	if (Bpp == 1) {
+
+		switch (opcode)
+		{
+			case BLIT_FALSE: BLIT_FALSE_TRANS_8(PARMST); break;
+			case BLIT_NOR: BLIT_NOR_TRANS_8(PARMST); break;
+			case BLIT_ONLYDST: BLIT_ONLYDST_TRANS_8(PARMST); break;
+			case BLIT_NOTSRC: BLIT_NOTSRC_TRANS_8(PARMST); break;
+			case BLIT_ONLYSRC: BLIT_ONLYSRC_TRANS_8(PARMST); break;
+			case BLIT_NOTDST: BLIT_NOTDST_TRANS_8(PARMST); break;
+			case BLIT_EOR: BLIT_EOR_TRANS_8(PARMST); break;
+			case BLIT_NAND: BLIT_NAND_TRANS_8(PARMST); break;
+			case BLIT_AND: BLIT_AND_TRANS_8(PARMST); break;
+			case BLIT_NEOR: BLIT_NEOR_TRANS_8(PARMST); break;
+			case BLIT_NOTONLYSRC: BLIT_NOTONLYSRC_TRANS_8(PARMST); break;
+			case BLIT_SRC: BLIT_SRC_TRANS_8(PARMST); break;
+			case BLIT_NOTONLYDST: BLIT_NOTONLYDST_TRANS_8(PARMST); break;
+			case BLIT_OR: BLIT_OR_TRANS_8(PARMST); break;
+			case BLIT_TRUE: BLIT_TRUE_TRANS_8(PARMST); break;
+			case BLIT_SWAP: BLIT_SWAP_TRANS_8(PARMST); break;
+		}
+
+	} else if (Bpp == 4) {
+
+		switch (opcode)
+		{
+			case BLIT_FALSE: BLIT_FALSE_TRANS_32(PARMST); break;
+			case BLIT_NOR: BLIT_NOR_TRANS_32(PARMST); break;
+			case BLIT_ONLYDST: BLIT_ONLYDST_TRANS_32(PARMST); break;
+			case BLIT_NOTSRC: BLIT_NOTSRC_TRANS_32(PARMST); break;
+			case BLIT_ONLYSRC: BLIT_ONLYSRC_TRANS_32(PARMST); break;
+			case BLIT_NOTDST: BLIT_NOTDST_TRANS_32(PARMST); break;
+			case BLIT_EOR: BLIT_EOR_TRANS_32(PARMST); break;
+			case BLIT_NAND: BLIT_NAND_TRANS_32(PARMST); break;
+			case BLIT_AND: BLIT_AND_TRANS_32(PARMST); break;
+			case BLIT_NEOR: BLIT_NEOR_TRANS_32(PARMST); break;
+			case BLIT_NOTONLYSRC: BLIT_NOTONLYSRC_TRANS_32(PARMST); break;
+			case BLIT_SRC: BLIT_SRC_TRANS_32(PARMST); break;
+			case BLIT_NOTONLYDST: BLIT_NOTONLYDST_TRANS_32(PARMST); break;
+			case BLIT_OR: BLIT_OR_TRANS_32(PARMST); break;
+			case BLIT_TRUE: BLIT_TRUE_TRANS_32(PARMST); break;
+		}
+
+	} else if (Bpp == 3) {
+
+		transparentcolor &= 0xffffff;
+		switch (opcode)
+		{
+			case BLIT_FALSE: BLIT_FALSE_TRANS_24(PARMST); break;
+			case BLIT_NOR: BLIT_NOR_TRANS_24(PARMST); break;
+			case BLIT_ONLYDST: BLIT_ONLYDST_TRANS_24(PARMST); break;
+			case BLIT_NOTSRC: BLIT_NOTSRC_TRANS_24(PARMST); break;
+			case BLIT_ONLYSRC: BLIT_ONLYSRC_TRANS_24(PARMST); break;
+			case BLIT_NOTDST: BLIT_NOTDST_TRANS_24(PARMST); break;
+			case BLIT_EOR: BLIT_EOR_TRANS_24(PARMST); break;
+			case BLIT_NAND: BLIT_NAND_TRANS_24(PARMST); break;
+			case BLIT_AND: BLIT_AND_TRANS_24(PARMST); break;
+			case BLIT_NEOR: BLIT_NEOR_TRANS_24(PARMST); break;
+			case BLIT_NOTONLYSRC: BLIT_NOTONLYSRC_TRANS_24(PARMST); break;
+			case BLIT_SRC: BLIT_SRC_TRANS_24(PARMST); break;
+			case BLIT_NOTONLYDST: BLIT_NOTONLYDST_TRANS_24(PARMST); break;
+			case BLIT_OR: BLIT_OR_TRANS_24(PARMST); break;
+			case BLIT_TRUE: BLIT_TRUE_TRANS_24(PARMST); break;
+		}
+
+	} else if (Bpp == 2) {
+
+		switch (opcode)
+		{
+			case BLIT_FALSE: BLIT_FALSE_TRANS_16(PARMST); break;
+			case BLIT_NOR: BLIT_NOR_TRANS_16(PARMST); break;
+			case BLIT_ONLYDST: BLIT_ONLYDST_TRANS_16(PARMST); break;
+			case BLIT_NOTSRC: BLIT_NOTSRC_TRANS_16(PARMST); break;
+			case BLIT_ONLYSRC: BLIT_ONLYSRC_TRANS_16(PARMST); break;
+			case BLIT_NOTDST: BLIT_NOTDST_TRANS_16(PARMST); break;
+			case BLIT_EOR: BLIT_EOR_TRANS_16(PARMST); break;
+			case BLIT_NAND: BLIT_NAND_TRANS_16(PARMST); break;
+			case BLIT_AND: BLIT_AND_TRANS_16(PARMST); break;
+			case BLIT_NEOR: BLIT_NEOR_TRANS_16(PARMST); break;
+			case BLIT_NOTONLYSRC: BLIT_NOTONLYSRC_TRANS_16(PARMST); break;
+			case BLIT_SRC: BLIT_SRC_TRANS_16(PARMST); break;
+			case BLIT_NOTONLYDST: BLIT_NOTONLYDST_TRANS_16(PARMST); break;
+			case BLIT_OR: BLIT_OR_TRANS_16(PARMST); break;
+			case BLIT_TRUE: BLIT_TRUE_TRANS_16(PARMST); break;
+		}
+
+	}
+}
+
+static void do_blitrect_frame_buffer (struct RenderInfo *ri, struct
 	RenderInfo *dstri, uae_u32 srcx, uae_u32 srcy,
 	uae_u32 dstx, uae_u32 dsty, uae_u32 width, uae_u32 height,
 	uae_u8 mask, uae_u32 RGBFmt, BLIT_OPCODE opcode)
@@ -2011,11 +2220,9 @@ static void do_blitrect_frame_buffer (const struct RenderInfo *ri, const struct
 				for (int i = 0; i < height; i++, src += ri->BytesPerRow, dst += dstri->BytesPerRow)
 					memmove (dst, src, total_width);
 			} else if (dsty < srcy) {
-				// write_log("BlitRect Fallback 2: w=%d, h=%d\n", width, height);
 				for (int i = 0; i < height; i++, src += ri->BytesPerRow, dst += dstri->BytesPerRow)
 					memcpy (dst, src, total_width);
 			} else {
-				// write_log("BlitRect Fallback 3: w=%d, h=%d\n", width, height);
 				src += (height - 1) * ri->BytesPerRow;
 				dst += (height - 1) * dstri->BytesPerRow;
 				for (int i = 0; i < height; i++, src -= ri->BytesPerRow, dst -= dstri->BytesPerRow)
@@ -3143,9 +3350,9 @@ static int missmodes[] = {
 	640,  480,
 	640,  512,
 	800,  600,
-   1024,  768,
-   1280, 1024,
-   -1
+	1024,  768,
+	1280, 1024,
+	-1
 };
 
 static int AssignModeID (int w, int h, int *unkcnt)
@@ -3213,12 +3420,13 @@ void picasso_allocatewritewatch (int index, int gfxmemsize)
 
 	delete[] dirty_page_map[index];
 	const int pages = gwwbufsize[index];
-	dirty_page_map[index] = new bool[pages];
+	dirty_page_map[index] = new std::atomic<bool>[pages];
 	dirty_page_map_size[index] = pages;
-	// Initialize min/max to "empty" state
-	min_dirty_page_index[index] = pages;
-	max_dirty_page_index[index] = -1;
-	memset(dirty_page_map[index], 0, pages * sizeof(bool));
+	// Initialize the bounds to the "empty" state (min = pages, max = -1)
+	dirty_bounds[index].store(static_cast<uae_u64>(pages) << 32);
+	for (int i = 0; i < pages; i++) {
+		dirty_page_map[index][i].store(false, std::memory_order_relaxed);
+	}
 #endif
 }
 
@@ -3255,30 +3463,49 @@ int picasso_getwritewatch (int index, int offset, uae_u8 ***gwwbufp, uae_u8 **st
 	const int page_size = gwwpagesize[index];
 	int count = 0;
 
-	int start = min_dirty_page_index[index];
-	int end = max_dirty_page_index[index];
-
-	if (start > end) {
-		return 0;
+	// Claim the whole dirty range with a single compare_exchange. If a
+	// writer widened the bounds between our load and the exchange, the
+	// exchange fails and we retry against the wider range instead of
+	// resetting over the freshly published pages and losing them.
+	const uae_u64 empty = static_cast<uae_u64>(dirty_page_map_size[index]) << 32;
+	uae_u64 cur = dirty_bounds[index].load();
+	int start;
+	int end;
+	for (;;) {
+		start = static_cast<int>(cur >> 32);
+		end = static_cast<int32_t>(static_cast<uint32_t>(cur)) - 1;
+		if (start > end) {
+			return 0;
+		}
+		if (dirty_bounds[index].compare_exchange_weak(cur, empty)) {
+			break;
+		}
 	}
 
-	// Reset bounds immediately for next frame accumulation
-	min_dirty_page_index[index] = dirty_page_map_size[index];
-	max_dirty_page_index[index] = -1;
-
+	// Clear with a single read-modify-write: a plain load/store pair could
+	// let a concurrent writer set the bit between our load and our clear,
+	// erasing its mark even though it republished the bounds covering it.
 	for (int i = start; i <= end; ++i) {
-		if (dirty_page_map[index][i]) {
+		if (dirty_page_map[index][i].exchange(false, std::memory_order_relaxed)) {
 			if (count < gwwbufsize[index]) {
 				gwwbuf[index][count++] = const_cast<uae_u8*>(base) + i * page_size;
 			}
-			dirty_page_map[index][i] = false; // Reset after reading
 		}
 	}
 
 	if (gwwbufp)
 		*gwwbufp = (uae_u8**)gwwbuf[index];
 	if (startp) {
-		*startp = const_cast<uae_u8*>(base);
+		// Match the Windows semantics: the region base is the board base
+		// plus the screen offset, not the bare board base. Returning the
+		// bare base would widen the caller's range filter to pages below
+		// the visible screen (e.g. offscreen bitmaps, the split region).
+		// The returned page list is page-aligned, so round the base down
+		// too: with a panned (SetPanning) screen offset that is not
+		// page-aligned, an unaligned base would reject the page holding
+		// the top-left of the visible screen after its dirty bit was
+		// already cleared, leaving it stale.
+		*startp = const_cast<uae_u8*>(base) + (offset & ~gwwpagemask[index]);
 	}
 	return count;
 #endif
@@ -3324,7 +3551,7 @@ bool picasso_is_vram_dirty (int index, uaecptr addr, int size)
 	if (end_page >= dirty_page_map_size[index]) end_page = dirty_page_map_size[index] - 1;
 
 	for (int i = start_page; i <= end_page; ++i) {
-		if (dirty_page_map[index][i]) { return true; }
+		if (dirty_page_map[index][i].load(std::memory_order_relaxed)) { return true; }
 	}
 	return false;
 #endif
@@ -3462,6 +3689,48 @@ static int addresolutions(void)
 			i++;
 		}
 	}
+#ifdef __ANDROID__
+	// Amiberry-local Android virtual RTG modes: Android/ChromeOS can
+	// expose only a small host-mode set, but Picasso96 is a virtual
+	// framebuffer and does not need its Workbench modes limited to it. Append
+	// the common missing resolutions from the Android-gated table before the
+	// dedup/sort; desktop mode lists are untouched by this block.
+	{
+		struct android_rtg_candidate template_mode = {};
+		if (cnt > 0) {
+			template_mode.depth = newmodes[0].depth;
+			template_mode.refresh = newmodes[0].refresh[0];
+		}
+		struct android_rtg_candidate candidates[android_virtual_rtg_mode_count];
+		const int budget = android_rtg_remaining_mode_budget(MAX_PICASSO_MODES, cnt);
+		const int added = android_rtg_build_modes(template_mode,
+			static_cast<long long>(gfxmem_bank.allocated_size) - 256,
+			budget, candidates);
+		for (int k = 0; k < added; k++) {
+			if (android_rtg_mode_fits_existing(candidates[k].width, candidates[k].height,
+				newmodes, cnt))
+				continue;
+			struct PicassoResolution* pr = &newmodes[cnt];
+			if (cnt > 0)
+				memcpy(pr, &newmodes[0], sizeof(struct PicassoResolution));
+			else
+				memset(pr, 0, sizeof(struct PicassoResolution));
+			pr->inuse = true;
+			pr->rawmode = false;
+			pr->lace = false;
+			pr->res.width = candidates[k].width;
+			pr->res.height = candidates[k].height;
+			pr->depth = candidates[k].depth;
+			pr->refresh[0] = candidates[k].refresh;
+			pr->refreshtype[0] = 0;
+			pr->refresh[1] = 0;
+			_sntprintf(pr->name, sizeof pr->name, _T("%s"), candidates[k].name);
+			size += PSSO_LibResolution_sizeof;
+			size += PSSO_ModeInfo_sizeof * depths;
+			cnt++;
+		}
+	}
+#endif
 	qsort(newmodes, cnt, sizeof (struct PicassoResolution), resolution_compare);
 
 
@@ -4398,13 +4667,15 @@ struct blitdata
 	uae_u32 height;
 	uae_u8 mask;
 	uae_u8 RGBFmt;
+	uae_u32 transparentcolor;
+	bool transparent;
 	BLIT_OPCODE opcode;
 } blitrectdata;
 
 static int BlitRectHelper(TrapContext *ctx)
 {
 	struct RenderInfo *ri = blitrectdata.ri;
-	const struct RenderInfo *dstri = blitrectdata.dstri;
+	struct RenderInfo *dstri = blitrectdata.dstri;
 	const uae_u32 srcx = blitrectdata.srcx;
 	const uae_u32 srcy = blitrectdata.srcy;
 	const uae_u32 dstx = blitrectdata.dstx;
@@ -4414,6 +4685,8 @@ static int BlitRectHelper(TrapContext *ctx)
 	const uae_u8 RGBFmt = blitrectdata.RGBFmt;
 	const uae_u8 mask = blitrectdata.mask;
 	const BLIT_OPCODE opcode = blitrectdata.opcode;
+	bool transparent = blitrectdata.transparent;
+	uae_u32 transparentcolor = blitrectdata.transparentcolor;
 
 	if (!validatecoords(ctx, ri, RGBFmt, &srcx, &srcy, &width, &height))
 		return 1;
@@ -4435,15 +4708,24 @@ static int BlitRectHelper(TrapContext *ctx)
 	}
 	/* Do our virtual frame-buffer memory first */
 #ifdef AMIBERRY
-	mark_dirty(rtg_index, dstri->Memory + dsty * dstri->BytesPerRow + dstx * GetBytesPerPixel(RGBFmt), height * dstri->BytesPerRow);
+	{
+		const uae_u32 dirtysize = dstri->BytesPerRow ? height * dstri->BytesPerRow : width * GetBytesPerPixel(RGBFmt);
+		mark_dirty(rtg_index, dstri->Memory + dsty * dstri->BytesPerRow + dstx * GetBytesPerPixel(RGBFmt), dirtysize);
+	}
 #endif
-	do_blitrect_frame_buffer(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, RGBFmt, opcode);
+	if (transparent) {
+		do_blitrect_frame_buffer_transparent(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, transparentcolor, RGBFmt, opcode);
+	} else {
+		do_blitrect_frame_buffer(ri, dstri, srcx, srcy, dstx, dsty, width, height, mask, RGBFmt, opcode);
+	}
 	return 1;
 }
 
 static int BlitRect(TrapContext *ctx, uaecptr ri, uaecptr dstri,
 	uae_u32 srcx, uae_u32 srcy, uae_u32 dstx, uae_u32 dsty,
-	uae_u32 width, uae_u32 height, uae_u8 mask, uae_u8 RGBFmt, BLIT_OPCODE opcode)
+	uae_u32 width, uae_u32 height, uae_u8 mask,
+	bool transparent, uae_u32 transparentcolor,
+	uae_u8 RGBFmt, BLIT_OPCODE opcode)
 {
 	/* Set up the params */
 	CopyRenderInfoStructureA2U(ctx, ri, &blitrectdata.ri_struct);
@@ -4463,8 +4745,30 @@ static int BlitRect(TrapContext *ctx, uaecptr ri, uaecptr dstri,
 	blitrectdata.mask = mask;
 	blitrectdata.opcode = opcode;
 	blitrectdata.RGBFmt = RGBFmt;
+	blitrectdata.transparent = transparent;
+	blitrectdata.transparentcolor = transparentcolor;
 
 	return BlitRectHelper(ctx);
+}
+
+static uae_u32 REGPARAM2 picasso_BlitRectTransparent(TrapContext *ctx)
+{
+	uaecptr renderinfo = trap_get_areg(ctx, 1);
+	uae_u32 srcx = (uae_u16)trap_get_dreg(ctx, 0);
+	uae_u32 srcy = (uae_u16)trap_get_dreg(ctx, 1);
+	uae_u32 dstx = (uae_u16)trap_get_dreg(ctx, 2);
+	uae_u32 dsty = (uae_u16)trap_get_dreg(ctx, 3);
+	uae_u32 width = (uae_u16)trap_get_dreg(ctx, 4);
+	uae_u32 height = (uae_u16)trap_get_dreg(ctx, 5);
+	uae_u32 color = trap_get_dreg(ctx, 6);
+	uae_u8  RGBFmt = (uae_u8)trap_get_dreg(ctx, 7);
+	uae_u32 result = 0;
+
+	if (NOBLITTER_BLIT)
+		return 0;
+	P96TRACE((_T("BlitRectTransparent(%d, %d, %d, %d, %d, %d, 0x%08x, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, color, RGBFmt));
+	result = BlitRect(ctx, renderinfo, 0, srcx, srcy, dstx, dsty, width, height, 0xff, true, color, RGBFmt, BLIT_SRC);
+	return result;
 }
 
 /***********************************************************
@@ -4496,8 +4800,8 @@ static uae_u32 REGPARAM2 picasso_BlitRect (TrapContext *ctx)
 
 	if (NOBLITTER_BLIT)
 		return 0;
-	P96TRACE((_T("BlitRect(%d, %d, %d, %d, %d, %d, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, Mask));
-	result = BlitRect(ctx, renderinfo, 0, srcx, srcy, dstx, dsty, width, height, Mask, RGBFmt, BLIT_SRC);
+	P96TRACE((_T("BlitRect(%d, %d, %d, %d, %d, %d, 0x%02x, 0x%02x)\n"), srcx, srcy, dstx, dsty, width, height, Mask, RGBFmt));
+	result = BlitRect(ctx, renderinfo, 0, srcx, srcy, dstx, dsty, width, height, Mask, false, 0, RGBFmt, BLIT_SRC);
 	return result;
 }
 
@@ -4539,7 +4843,7 @@ static uae_u32 REGPARAM2 picasso_BlitRectNoMaskComplete (TrapContext *ctx)
 	P96TRACE((_T("BlitRectNoMaskComplete() op 0x%02x, %08x:(%4d,%4d) --> %08x:(%4d,%4d), wh(%4d,%4d)\n"),
 		OpCode, trap_get_long(ctx, srcri + PSSO_RenderInfo_Memory), srcx, srcy,
 		trap_get_long(ctx, dstri + PSSO_RenderInfo_Memory), dstx, dsty, width, height));
-	result = BlitRect(ctx, srcri, dstri, srcx, srcy, dstx, dsty, width, height, 0xFF, RGBFmt, OpCode);
+	result = BlitRect(ctx, srcri, dstri, srcx, srcy, dstx, dsty, width, height, 0xFF, false, 0, RGBFmt, OpCode);
 	return result;
 }
 
@@ -6191,6 +6495,7 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 	int maxy = -1;
 	int miny = pheight - 1;
 	int flushlines = 0, matchcount = 0;
+	int partial_gwwcnt = -1; // dirty pages drained once, reused for both split regions
 	struct picasso_vidbuf_description *vidinfo = &picasso_vidinfo[monid];
 	bool overlay_updated = false;
 
@@ -6242,23 +6547,68 @@ static void picasso_flushpixels(int index, uae_u8 *src, int off, bool render)
 			if (vidinfo->full_refresh < 0 || overlay_updated) {
 				gwwcnt = regionsize / gwwpagesize[index] + 1;
 				vidinfo->full_refresh = 1;
+				// Synthesize the page list (WinUAE parity; this fill was lost
+				// in a refactor): the copy loop below consumes gwwbuf entries,
+				// so leaving stale pointers from the last drain here would
+				// filter most or all of them out and the forced full copy
+				// would not happen.
+				for (int i = 0; i < gwwcnt; i++) {
+					gwwbuf[index][i] = src_start[split] + i * gwwpagesize[index];
+				}
+				matchcount += (int)gwwcnt;
+
+				if (gwwcnt == 0) {
+					continue;
+				}
+				dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 			} else {
 #if defined(_WIN32) && !defined(AMIBERRY)
 				ULONG ps;
 				gwwcnt = gwwbufsize[index];
 				if (mman_GetWriteWatch(src_start[split], regionsize, gwwbuf[index], &gwwcnt, &ps))
 					continue;
+				matchcount += (int)gwwcnt;
+
+				if (gwwcnt == 0) {
+					continue;
+				}
+				dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 #else
-				gwwcnt = picasso_getwritewatch(index, off, (uae_u8***)&gwwbuf[index], &src_start[split]);
+				// The emulated write-watch drains the whole dirty map, so it
+				// must only be drained on the first region; the second
+				// (split) region reuses the same page list. Draining per
+				// region would clear pages that belong to the other region
+				// and leave it stale.
+				if (split == 0) {
+					partial_gwwcnt = picasso_getwritewatch(index, off, (uae_u8***)&gwwbuf[index], &src_start[split]);
+				}
+				gwwcnt = partial_gwwcnt;
+
+				// The reused page list spans both split regions (and may
+				// contain pages outside the visible screen, e.g. offscreen
+				// bitmaps), so filter it down to this region when deciding
+				// between a full copy and partial rows. The copy loop below
+				// must keep iterating the FULL list: it range-checks each
+				// entry itself, and truncating the count here would hide
+				// matching pages that sit behind foreign (lower-split or
+				// offscreen) pages in the page-ordered list after their
+				// dirty bits have already been cleared.
+				int region_gwwcnt = 0;
+				for (int i = 0; i < gwwcnt; i++) {
+					const uae_u8* p = static_cast<uae_u8*>(gwwbuf[index][i]);
+					if (p >= src_start[split] && p < src_end[split]) {
+						region_gwwcnt++;
+					}
+				}
+				matchcount += region_gwwcnt;
+
+				if (region_gwwcnt == 0) {
+					continue;
+				}
+				dofull = region_gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 #endif
 			}
 
-			matchcount += (int)gwwcnt;
-
-			if (gwwcnt == 0) {
-				continue;
-			}
-			dofull = gwwcnt >= (regionsize / gwwpagesize[index]) * 80 / 100;
 
 			if (!dstp) {
 				dstp = gfx_lock_picasso(monid, dofull);
@@ -7233,6 +7583,7 @@ static void inituaegfxfuncs(TrapContext *ctx, uaecptr start, uaecptr ABI)
 	RTGCALL(PSSO_BoardInfo_BlitTemplate, PSSO_BoardInfo_BlitTemplateDefault, picasso_BlitTemplate);
 	RTGCALL(PSSO_BoardInfo_InvertRect, PSSO_BoardInfo_InvertRectDefault, picasso_InvertRect);
 	RTGCALL(PSSO_BoardInfo_BlitRectNoMaskComplete, PSSO_BoardInfo_BlitRectNoMaskCompleteDefault, picasso_BlitRectNoMaskComplete);
+	RTGCALL(PSSO_BoardInfo_BlitRectTransparent, PSSO_BoardInfo_BlitRectTransparentDefault, picasso_BlitRectTransparent);
 	RTGCALL(PSSO_BoardInfo_BlitPattern, PSSO_BoardInfo_BlitPatternDefault, picasso_BlitPattern);
 
 	RTGCALL2(PSSO_BoardInfo_SetSwitch, picasso_SetSwitch);
@@ -7377,7 +7728,7 @@ void uaegfx_install_code (uaecptr start)
 }
 
 #define UAEGFX_VERSION 3
-#define UAEGFX_REVISION 4
+#define UAEGFX_REVISION 5
 
 static uae_u32 REGPARAM2 gfx_open(TrapContext *ctx)
 {
@@ -7500,7 +7851,7 @@ uae_u32 picasso_demux (uae_u32 arg, TrapContext *ctx)
 	const uae_u32 num = trap_get_long(ctx, trap_get_areg(ctx, 7) + 4);
 
 	if (uaegfx_base) {
-		if (num >= 16 && num <= 39) {
+		if (num >= 16 && num <= 40) {
 			write_log (_T("uaelib: obsolete Picasso96 uaelib hook called, call ignored\n"));
 			return 0;
 		}
@@ -7534,7 +7885,8 @@ uae_u32 picasso_demux (uae_u32 arg, TrapContext *ctx)
 	 case 36: return picasso_SetSprite (ctx);
 	 case 37: return picasso_SetSpritePosition (ctx);
 	 case 38: return picasso_SetSpriteImage (ctx);
-	 case 39: return picasso_SetSpriteColor (ctx);
+	 case 39: return picasso_SetSpriteColor(ctx);
+	 case 40: return picasso_BlitRectTransparent(ctx);
 	default: return 0;
 	}
 

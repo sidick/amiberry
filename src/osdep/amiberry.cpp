@@ -31,6 +31,8 @@
 #include <fstream>
 #include <filesystem>
 #include <vector>
+#include <unordered_map>
+#include <functional>
 
 #include "sysdeps.h"
 #include "options.h"
@@ -67,6 +69,7 @@
 #include "amiberry_update.h"
 #include "clipboard.h"
 #include "dpi_handler.hpp"
+#include "gui_layout_scale.h"
 #include "fsdb.h"
 #include "scsidev.h"
 #ifdef FLOPPYBRIDGE
@@ -79,6 +82,8 @@
 #include "gui_handling_platform.h"
 #include "gui/gui_handling.h"
 #include "on_screen_joystick.h"
+#include "amiberry_mouse_capture.h"
+#include "amiberry_mouse_delta.h"
 #include "imgui_osk.h"
 #ifdef __ANDROID__
 #include "android_touch_mouse.h"
@@ -142,6 +147,11 @@ static bool android_last_joystick_enabled = false;
 static bool android_pen_blocks_touch = false;
 static std::atomic<bool> android_touch_neutralization_pending{false};
 
+// Sub-pixel relative mouse accumulation (amiberry_mouse_delta.h): one
+// residual per mouse for the captured absolute-hover path (#2285).
+static std::array<amiberry_mouse_delta_accumulator, MAX_INPUT_DEVICES>
+	android_mouse_deltas;
+
 struct AndroidGuiSwipeFilterContact {
 	std::atomic<android_touch_mouse::TouchId> touch_id{0};
 	std::atomic<android_touch_mouse::FingerId> finger_id{0};
@@ -161,6 +171,19 @@ static android_touch_mouse::TouchKey amiberry_android_touch_key(const SDL_Event&
 static void amiberry_android_clear_gui_swipe_filter()
 {
 	android_gui_swipe_filter_active_mask.store(0, std::memory_order_release);
+}
+
+static void amiberry_android_reset_mouse_deltas()
+{
+	android_mouse_deltas.fill({});
+}
+
+static amiberry_mouse_delta_accumulator& amiberry_android_mouse_delta(
+	const int mouse_index)
+{
+	if (mouse_index < 0 || mouse_index >= MAX_INPUT_DEVICES)
+		return android_mouse_deltas[0];
+	return android_mouse_deltas[mouse_index];
 }
 
 static void amiberry_android_publish_gui_swipe_filter(
@@ -552,6 +575,7 @@ int pissoff_value = 15000 * CYCLE_UNIT;
 int pissoff_nojit_value = 160 * CYCLE_UNIT;
 int multithread_enabled = 1;
 
+bool amiberry_dump_config_mode = false;
 static TCHAR* inipath = nullptr;
 extern FILE* debugfile;
 static int forceroms;
@@ -753,25 +777,30 @@ static void set_key_configs(const uae_prefs* p)
 	if (enter_gui_key.scancode == 0)
 		enter_gui_key.scancode = SDL_SCANCODE_F12;
 
+	// Install the OSK toggle button only while the on-screen keyboard is
+	// enabled: with it disabled, intercepting the button would swallow input
+	// games could use (AKS_OSK does nothing in that state). Enabling the
+	// keyboard later reinstalls it (gfx_prefs_check).
+	if (p->vkbd_enabled)
+	{
+		vkbd_key = get_hotkey_from_config(p->vkbd_toggle);
+		vkbd_button = SDL_GetGamepadButtonFromString(p->vkbd_toggle);
+	}
+	else
+	{
+		vkbd_key = {};
+		vkbd_button = SDL_GAMEPAD_BUTTON_INVALID;
+	}
+
 	enter_gui_button = SDL_GetGamepadButtonFromString(p->open_gui);
 #ifdef __ANDROID__
 	// Android: default Start button as pause/GUI toggle for hardware controllers
-	// (no F12 key available, and software back button isn't accessible from gamepads)
-	if (enter_gui_button == SDL_GAMEPAD_BUTTON_INVALID)
+	// (no F12 key available, and software back button isn't accessible from gamepads).
+	// An explicitly selected Start keyboard toggle wins over that fallback; Guide
+	// and Back remain available as menu triggers.
+	if (enter_gui_button == SDL_GAMEPAD_BUTTON_INVALID && vkbd_button != SDL_GAMEPAD_BUTTON_START)
 		enter_gui_button = SDL_GAMEPAD_BUTTON_START;
 #endif
-	if (enter_gui_button != SDL_GAMEPAD_BUTTON_INVALID)
-	{
-		for (int port = 0; port < 2; port++)
-		{
-			const auto host_joy_id = p->jports[port].id - JSEM_JOYS;
-			if (host_joy_id >= 0 && host_joy_id < MAX_INPUT_DEVICES)
-			{
-				didata* did = &di_joystick[host_joy_id];
-				did->mapping.menu_button = enter_gui_button;
-			}
-		}
-	}
 	
 	quit_key = get_hotkey_from_config(p->quit_amiberry);
 
@@ -788,21 +817,8 @@ static void set_key_configs(const uae_prefs* p)
 
 	debugger_key = get_hotkey_from_config(p->debugger_trigger);
 
-	vkbd_key = get_hotkey_from_config(p->vkbd_toggle);
-
-	vkbd_button = SDL_GetGamepadButtonFromString(p->vkbd_toggle);
-	if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID)
-	{
-		for (int port = 0; port < 2; port++)
-		{
-			const auto host_joy_id = p->jports[port].id - JSEM_JOYS;
-			if (host_joy_id >= 0 && host_joy_id < MAX_INPUT_DEVICES)
-			{
-				didata* did = &di_joystick[host_joy_id];
-				did->mapping.vkbd_button = vkbd_button;
-			}
-		}
-	}
+	for (auto& did : di_joystick)
+		sync_controller_shortcuts(&did);
 }
 
 #ifndef _WIN32
@@ -1604,6 +1620,11 @@ static bool consume_pending_mouse_capture(const int monid, int* active)
 #ifndef LIBRETRO
 static bool apply_mouse_capture_grabs(AmigaMonitor* mon)
 {
+#ifdef __ANDROID__
+	// A new capture session must not inherit a stale sub-pixel residual
+	// from the previous one.
+	amiberry_android_reset_mouse_deltas();
+#endif
 	const bool mouse_grab_ok = SDL_SetWindowMouseGrab(mon->amiga_window, true);
 	if (!mouse_grab_ok) {
 		write_log("SDL_SetWindowMouseGrab(true) failed on monitor %d: %s\n", mon->monitor_id, SDL_GetError());
@@ -1618,8 +1639,14 @@ static bool apply_mouse_capture_grabs(AmigaMonitor* mon)
 	// SDL hides the cursor when Relative mode is enabled.
 	// This means that the RTG hardware sprite will no longer be shown,
 	// unless it's configured to use Virtual Mouse (absolute movement).
+	constexpr bool capture_platform_is_android =
+#ifdef __ANDROID__
+		true;
+#else
+		false;
+#endif
 	bool relative_ok = true;
-	if (!currprefs.input_tablet) {
+	if (amiberry_capture_uses_relative_mouse_mode(capture_platform_is_android, currprefs.input_tablet)) {
 		relative_ok = SDL_SetWindowRelativeMouseMode(mon->amiga_window, true);
 		if (!relative_ok) {
 			write_log("SDL_SetWindowRelativeMouseMode(true) failed on monitor %d: %s\n",
@@ -1649,6 +1676,11 @@ static bool apply_mouse_capture_grabs(AmigaMonitor*) { return true; }
 
 void releasecapture(const AmigaMonitor* mon)
 {
+#ifdef __ANDROID__
+	// Capture teardown (focus loss, GUI open, user release) ends the
+	// session: drop any pending sub-pixel residual.
+	amiberry_android_reset_mouse_deltas();
+#endif
 	if (mon && mon->amiga_window) {
 		SDL_SetWindowMouseGrab(mon->amiga_window, false);
 		SDL_SetWindowKeyboardGrab(mon->amiga_window, false);
@@ -1754,6 +1786,9 @@ static bool accepts_uncaptured_guest_input()
 
 void target_inputdevice_unacquire(const bool full)
 {
+	// Releases consumed by the GUI/background event loop cannot update OSK
+	// ownership. End the session before transferring input away from emulation.
+	imgui_osk_hide();
 #ifdef __ANDROID__
 	amiberry_android_touch_mouse_neutralize();
 	amiberry_android_clear_all_mouse_button_sources();
@@ -1769,6 +1804,7 @@ void target_inputdevice_acquire()
 	const AmigaMonitor* mon = &AMonitors[0];
 	target_inputdevice_unacquire(false);
 	tablet = open_tablet(mon->amiga_window);
+	osk_clear_controller_holds();
 }
 
 static void setmouseactive2(AmigaMonitor* mon, int active, const bool allowpause)
@@ -2772,213 +2808,398 @@ static void handle_clipboard_update_event()
 	}
 }
 
-void handle_joy_device_event(const SDL_JoystickID which, const bool removed)
+struct OskControllerState {
+	enum AxisOwner { Neutral, Gameplay, Osk };
+	int buttons = 0;
+	int stick = 0;
+	AxisOwner axis_owner[2] = {};
+};
+
+struct OskHatState {
+	int physical = SDL_HAT_CENTERED;
+	int gameplay = SDL_HAT_CENTERED;
+};
+
+static std::unordered_map<SDL_JoystickID, OskControllerState> osk_controllers;
+static std::unordered_map<Uint64, OskHatState> osk_hats;
+
+static void osk_publish_controller_state()
 {
-	bool known_device = false;
-	for (int id = 0; id < MAX_INPUT_DEVICES; ++id)
-	{
-		const didata* did = &di_joystick[id];
-		if (!did->guid.empty() && did->joystick_id == which)
-		{
-			known_device = true;
-			break;
-		}
+	int state = 0;
+	for (const auto& entry : osk_controllers)
+		state |= entry.second.buttons | entry.second.stick;
+	const int dx = (state & OSK_LEFT) ? -1 : (state & OSK_RIGHT) ? 1 : 0;
+	const int dy = (state & OSK_UP) ? -1 : (state & OSK_DOWN) ? 1 : 0;
+	osk_control(dx, dy, 0, 0, OskInputSource::Gamepad);
+	osk_control(0, 0, 1, (state & OSK_BUTTON) != 0, OskInputSource::Gamepad);
+}
+
+static bool osk_axis_is_held(const int id, const int axis, const int value)
+{
+	return abs(value) > SDL_JOYSTICK_AXIS_MAX * 2 / 5
+		|| controller_axis_has_gameplay_input(id, axis, value);
+}
+
+void osk_clear_controller_holds()
+{
+	for (auto& entry : osk_controllers) {
+		entry.second.buttons = 0;
+		entry.second.stick = 0;
 	}
-	if (!known_device || removed)
-	{
-		write_log("SDL Gamepad/Joystick added or removed, re-enumerating input devices...\n");
-		if (inputdevice_devicechange(&changed_prefs))
-		{
-			joystick_refresh_needed = true;
+	// Clear session navigation, not gesture ownership. Polling can observe a
+	// release consumed by the GUI, but cannot give a held OSK gesture to UAE.
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || !did.is_controller)
+			continue;
+		auto& state = osk_controllers[did.joystick_id];
+		for (int axis = SDL_GAMEPAD_AXIS_LEFTX; axis <= SDL_GAMEPAD_AXIS_LEFTY; ++axis) {
+			int value = 0;
+			if (did.mapping.is_retroarch) {
+				const int raw = did.mapping.axis[axis];
+				if (raw >= 0 && raw < did.axles)
+					value = SDL_GetJoystickAxis(did.joystick, raw);
+			} else {
+				value = SDL_GetGamepadAxis(did.controller, static_cast<SDL_GamepadAxis>(axis));
+			}
+			if (state.axis_owner[axis] != OskControllerState::Osk
+				|| !osk_axis_is_held(id, axis, value)) {
+				state.axis_owner[axis] = controller_axis_has_gameplay_input(id, axis, value)
+					? OskControllerState::Gameplay : OskControllerState::Neutral;
+			}
+		}
+		if (did.mapping.is_retroarch) {
+			for (int hat = 0; hat < SDL_GetNumJoystickHats(did.joystick); ++hat) {
+				const int value = SDL_GetJoystickHat(did.joystick, hat);
+				const Uint64 key = (static_cast<Uint64>(did.joystick_id) << 8) | hat;
+				auto& state = osk_hats[key];
+				state.gameplay = value & ~(state.physical & ~state.gameplay);
+				state.physical = value;
+			}
+		}
+		// Reconcile the modifier with the physical stick instead of dropping
+		// it: a remapped press must meet its release at the same offset.
+		bool held = false;
+		if (did.mapping.hotkey_button >= 0) {
+			held = did.mapping.is_retroarch
+				? (did.joystick && SDL_GetJoystickButton(did.joystick, did.mapping.hotkey_button))
+				: (did.controller && SDL_GetGamepadButton(did.controller, static_cast<SDL_GamepadButton>(did.mapping.hotkey_button)));
+		}
+		did.hotkey_held = held;
+		if (!held && did.remapped_press_mask) {
+			// The modifier is gone — its release may have been consumed by
+			// another event loop — so pending remapped releases would miss
+			// their offset. Neutralize those presses explicitly.
+			for (int button = 0; button < SDL_GAMEPAD_BUTTON_COUNT; ++button)
+				if (did.remapped_press_mask & (1u << button))
+					setjoybuttonstate(id, button + REMAP_BUTTONS, 0);
+			did.remapped_press_mask = 0;
 		}
 	}
 }
 
-static void handle_controller_button_event(const SDL_Event& event)
+void handle_joy_device_event(const SDL_JoystickID which, const bool removed)
 {
-	const auto button = event.gbutton.button;
-	const auto state = event.gbutton.down;
-	const auto which = event.gbutton.which;
+	if (removed) {
+		osk_controllers.erase(which);
+		for (auto it = osk_hats.begin(); it != osk_hats.end();) {
+			if ((it->first >> 8) == which)
+				it = osk_hats.erase(it);
+			else
+				++it;
+		}
+		if (imgui_osk_is_active())
+			osk_publish_controller_state();
+	}
+	bool known_device = false;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const didata* did = &di_joystick[id];
+		if (!did->guid.empty() && did->joystick_id == which) {
+			known_device = true;
+			break;
+		}
+	}
+	if (!known_device || removed) {
+		write_log("SDL Gamepad/Joystick added or removed, re-enumerating input devices...\n");
+		if (inputdevice_devicechange(&changed_prefs))
+			joystick_refresh_needed = true;
+	}
+}
 
+// Return true only for OSK-owned input. A release of a gameplay-held control
+// continues to the device reader, whose passthrough scope prevents recapture.
+static bool handle_osk_button(const SDL_JoystickID which, const int button, const bool down)
+{
+	if (!imgui_osk_should_render())
+		return false;
+	if (!imgui_osk_is_active())
+		return down;
+
+	int bit = 0;
+	switch (button) {
+	case SDL_GAMEPAD_BUTTON_DPAD_UP: bit = OSK_UP; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_DOWN: bit = OSK_DOWN; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_LEFT: bit = OSK_LEFT; break;
+	case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: bit = OSK_RIGHT; break;
+	case SDL_GAMEPAD_BUTTON_SOUTH: bit = OSK_BUTTON; break;
+	default: break;
+	}
+	if (bit) {
+		auto& state = osk_controllers[which];
+		const bool owned = (state.buttons & bit) != 0;
+		if (down)
+			state.buttons |= bit;
+		else
+			state.buttons &= ~bit;
+		osk_publish_controller_state();
+		return down || owned;
+	}
+	if (button == SDL_GAMEPAD_BUTTON_EAST && down)
+		imgui_osk_hide();
+	return down;
+}
+
+static bool handle_gamepad_button(const SDL_JoystickID which, const int button, const bool down)
+{
+	// Explicit OSK binding wins over menu/other shortcuts. AKS_OSK toggles on
+	// either state, so consume both edges but enqueue only the press.
+	if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID && button == vkbd_button) {
+		if (down)
+			inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+	}
 #ifdef __ANDROID__
-	// Guide button: reliable menu trigger on Android gamepads (not used by Amiga software)
-	if (button == SDL_GAMEPAD_BUTTON_GUIDE) {
-		inputdevice_add_inputcode(AKS_ENTERGUI, state, nullptr);
-		return;
+	else if (button == SDL_GAMEPAD_BUTTON_GUIDE) {
+		inputdevice_add_inputcode(AKS_ENTERGUI, down, nullptr);
 	}
 #endif
-
-	if (button == enter_gui_button) {
-		inputdevice_add_inputcode(AKS_ENTERGUI, state, nullptr);
+	else if (button == enter_gui_button) {
+		inputdevice_add_inputcode(AKS_ENTERGUI, down, nullptr);
 	}
 	else if (quit_key.button && button == quit_key.button) {
 		uae_quit();
 	}
 	else if (action_replay_key.button && button == action_replay_key.button) {
-		inputdevice_add_inputcode(AKS_FREEZEBUTTON, state, nullptr);
+		inputdevice_add_inputcode(AKS_FREEZEBUTTON, down, nullptr);
 	}
 	else if (fullscreen_key.button && button == fullscreen_key.button) {
-		inputdevice_add_inputcode(AKS_TOGGLEWINDOWFULLWINDOW, state, nullptr);
+		inputdevice_add_inputcode(AKS_TOGGLEWINDOWFULLWINDOW, down, nullptr);
 	}
 	else if (minimize_key.button && button == minimize_key.button) {
 		minimizewindow(0);
 	}
-	else if (vkbd_button != SDL_GAMEPAD_BUTTON_INVALID && button == vkbd_button) {
-		inputdevice_add_inputcode(AKS_OSK, state, nullptr);
-	}
-	else if (imgui_osk_should_render()) {
-		// When OSK is visible or animating, intercept D-pad and face buttons at the SDL level
-		// before they reach UAE's input system. This ensures immediate response.
-		// Track per-button state so releasing one direction doesn't lose the other.
-		if (!imgui_osk_is_active())
-			return;
-
-		static bool dpad_up = false, dpad_down = false, dpad_left = false, dpad_right = false;
-		bool is_dir = true;
-		switch (button) {
-		case SDL_GAMEPAD_BUTTON_DPAD_UP:    dpad_up    = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_DOWN:  dpad_down  = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_LEFT:  dpad_left  = state; break;
-		case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: dpad_right = state; break;
-		default: is_dir = false; break;
-		}
-		if (is_dir) {
-			int dx = 0, dy = 0;
-			if (dpad_left)  dx = -1;
-			else if (dpad_right) dx = 1;
-			if (dpad_up)    dy = -1;
-			else if (dpad_down)  dy = 1;
-			osk_control(dx, dy, 0, 0);
-			return; // consume — don't pass to UAE input system
-		}
-		// Fire button (A/South) = press key
-		if (button == SDL_GAMEPAD_BUTTON_SOUTH) {
-			osk_control(0, 0, 1, state);
-			return;
-		}
-		// B/East = close keyboard
-		if (button == SDL_GAMEPAD_BUTTON_EAST && state) {
-			imgui_osk_toggle();
-			return;
-		}
-	}
 	else if (screenshot_key.button && button == screenshot_key.button) {
-		inputdevice_add_inputcode(AKS_SCREENSHOT_FILE, state, nullptr);
+		inputdevice_add_inputcode(AKS_SCREENSHOT_FILE, down, nullptr);
 	}
 	else if (debugger_key.button && button == debugger_key.button) {
-		inputdevice_add_inputcode(AKS_ENTERDEBUGGER, state, nullptr);
+		inputdevice_add_inputcode(AKS_ENTERDEBUGGER, down, nullptr);
+	}
+	else if (imgui_osk_should_render()) {
+		return handle_osk_button(which, button, down);
 	}
 	else {
-		for (auto id = 0; id < MAX_INPUT_DEVICES; id++) {
-			didata* did = &di_joystick[id];
-			if (did->name.empty() || did->joystick_id != which || did->mapping.is_retroarch || !did->is_controller) continue;
-
-			// Update per-device hotkey state in event order
-			if (button == did->mapping.hotkey_button)
-			{
-				did->hotkey_held = state;
-				break;
-			}
-
-			read_controller_button(id, button, state);
-			break;
-		}
+		return false;
 	}
+	return true;
+}
 
+static void handle_controller_button_event(const SDL_Event& event)
+{
+	const auto button = event.gbutton.button;
+	const auto down = event.gbutton.down;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.gbutton.which || !did.is_controller)
+			continue;
+		// RetroArch's logical mapping need not match SDL's. Its raw event path
+		// is the sole owner of both OSK navigation and gameplay dispatch.
+		if (did.mapping.is_retroarch)
+			return;
+		if (handle_gamepad_button(did.joystick_id, button, down))
+			return;
+		if (button == did.mapping.hotkey_button)
+			did.hotkey_held = down;
+		else
+			read_controller_button(id, button, down);
+		return;
+	}
 }
 
 static void handle_joy_button_event(const SDL_Event& event)
 {
 	const auto button = event.jbutton.button;
-	const auto state = event.jbutton.down;
-	const auto which = event.jbutton.which;
+	const auto down = event.jbutton.down;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jbutton.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
 
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
+		const bool configured_toggle = vkbd_button != SDL_GAMEPAD_BUTTON_INVALID
+			&& did.mapping.button_unmasked[vkbd_button] == button;
 #ifdef __ANDROID__
-		// On Android, allow menu button without hotkey — devices may have no
-		// accessible hotkey modifier (e.g. built-in gamepad on handhelds).
-		if (button == did->mapping.menu_button && state)
-		{
+		const bool direct_toggle = configured_toggle;
+#else
+		const bool direct_toggle = configured_toggle && did.is_controller;
+#endif
+		if (direct_toggle) {
+			if (down)
+				inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+			return;
+		}
+		// Raw shortcuts are independent of the global-derived mapping.
+		// Do not destroy RetroArch's saved binding on disable, but do gate use.
+		if (button == did.mapping.vkbd_button && currprefs.vkbd_enabled
+			&& currprefs.vkbd_toggle[0]
+			&& (did.hotkey_held || did.mapping.hotkey_button == SDL_GAMEPAD_BUTTON_INVALID)) {
+			if (down)
+				inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
+			return;
+		}
+#ifdef __ANDROID__
+		if (button == did.mapping.menu_button && down) {
 			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
-			break;
+			return;
 		}
 #endif
-
-		// Update per-device hotkey state in event order (not polled)
-		if (button == did->mapping.hotkey_button)
-		{
-			did->hotkey_held = state;
-			break;
+		if (button == did.mapping.hotkey_button) {
+			did.hotkey_held = down;
+			return;
 		}
-		if (button == did->mapping.menu_button && did->hotkey_held && state)
-		{
-			did->hotkey_held = false;
+		if (button == did.mapping.menu_button && did.hotkey_held && down) {
+			did.hotkey_held = false;
 			inputdevice_add_inputcode(AKS_ENTERGUI, 1, nullptr);
-			break;
+			return;
 		}
-		if (button == did->mapping.vkbd_button && did->hotkey_held && state)
-		{
-			did->hotkey_held = false;
-			inputdevice_add_inputcode(AKS_OSK, 1, nullptr);
-			break;
+		if (did.is_controller) {
+			const int logical = find_in_array(did.mapping.button_unmasked.data(), SDL_GAMEPAD_BUTTON_COUNT, button);
+			if (handle_gamepad_button(did.joystick_id, logical, down))
+				return;
 		}
-
-		read_joystick_button_single(id, button, state);
-		break;
+		read_joystick_button_single(id, button, down);
+		return;
 	}
+}
 
+static bool handle_osk_axis(const int id, const int axis, int& value)
+{
+	if (axis != SDL_GAMEPAD_AXIS_LEFTX && axis != SDL_GAMEPAD_AXIS_LEFTY)
+		return false;
+	auto& state = osk_controllers[di_joystick[id].joystick_id];
+	const int mask = axis == SDL_GAMEPAD_AXIS_LEFTX ? OSK_LEFT | OSK_RIGHT : OSK_UP | OSK_DOWN;
+	state.stick &= ~mask;
+	if (!imgui_osk_is_active()) {
+		if (state.axis_owner[axis] == OskControllerState::Osk) {
+			if (!osk_axis_is_held(id, axis, value))
+				state.axis_owner[axis] = OskControllerState::Neutral;
+			return true;
+		}
+		// Closing animation still owns navigation. Only neutralization may
+		// reach gameplay until the keyboard has left the screen.
+		if (imgui_osk_should_render())
+			value = 0;
+		state.axis_owner[axis] = controller_axis_has_gameplay_input(id, axis, value)
+			? OskControllerState::Gameplay : OskControllerState::Neutral;
+		return false;
+	}
+	const bool pressed = abs(value) > SDL_JOYSTICK_AXIS_MAX * 2 / 5;
+	if (state.axis_owner[axis] == OskControllerState::Gameplay) {
+		if (!pressed) {
+			// Explicitly neutralize the mapped consumer before handing the
+			// axis to the OSK; forwarding a small nonzero value can keep a
+			// mouse-mode controller moving indefinitely.
+			value = 0;
+			state.axis_owner[axis] = OskControllerState::Neutral;
+		}
+		return false;
+	}
+	state.axis_owner[axis] = osk_axis_is_held(id, axis, value)
+		? OskControllerState::Osk : OskControllerState::Neutral;
+	if (pressed) {
+		if (axis == SDL_GAMEPAD_AXIS_LEFTX)
+			state.stick |= value < 0 ? OSK_LEFT : OSK_RIGHT;
+		else
+			state.stick |= value < 0 ? OSK_UP : OSK_DOWN;
+	}
+	osk_publish_controller_state();
+	return true;
 }
 
 static void handle_controller_axis_motion_event(const SDL_Event& event)
 {
-	const auto axis = event.gaxis.axis;
-	const auto value = event.gaxis.value;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != event.gaxis.which || did->mapping.is_retroarch || !did->is_controller) continue;
-
-		read_controller_axis(id, axis, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.gaxis.which
+			|| did.mapping.is_retroarch || !did.is_controller)
+			continue;
+		int value = event.gaxis.value;
+		const bool invert = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX ? did.mapping.lstick_axis_x_invert
+			: event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY && did.mapping.lstick_axis_y_invert;
+		int normalized = invert ? -value : value;
+		if (!handle_osk_axis(id, event.gaxis.axis, normalized)) {
+			if (normalized == 0)
+				value = 0;
+			read_controller_axis(id, event.gaxis.axis, value);
+		}
+		return;
 	}
-
 }
 
 static void handle_joy_axis_motion_event(const SDL_Event& event)
 {
-	const auto axis = event.jaxis.axis;
-	const auto value = event.jaxis.value;
-	const auto which = event.jaxis.which;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
-		read_joystick_axis(id, axis, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jaxis.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
+		int value = event.jaxis.value;
+		if (did.is_controller) {
+			for (int axis = 0; axis < SDL_GAMEPAD_AXIS_COUNT; ++axis) {
+				if (did.mapping.axis[axis] != event.jaxis.axis)
+					continue;
+				const bool invert = axis == SDL_GAMEPAD_AXIS_LEFTX ? did.mapping.lstick_axis_x_invert
+					: axis == SDL_GAMEPAD_AXIS_LEFTY && did.mapping.lstick_axis_y_invert;
+				int normalized = invert ? -value : value;
+				if (handle_osk_axis(id, axis, normalized))
+					return;
+				if (normalized == 0)
+					value = 0;
+				break;
+			}
+		}
+		read_joystick_axis(id, event.jaxis.axis, value);
+		return;
 	}
-
 }
 
 static void handle_joy_hat_motion_event(const SDL_Event& event)
 {
-	const auto hat = event.jhat.hat;
-	const auto value = event.jhat.value;
-	const auto which = event.jhat.which;
-
-	for (auto id = 0; id < MAX_INPUT_DEVICES; id++)
-	{
-		const didata* did = &di_joystick[id];
-		if (did->name.empty() || did->joystick_id != which || (!did->mapping.is_retroarch && did->is_controller)) continue;
-
-		read_joystick_hat(id, hat, value);
-		break;
+	for (int id = 0; id < MAX_INPUT_DEVICES; ++id) {
+		const auto& did = di_joystick[id];
+		if (did.name.empty() || did.joystick_id != event.jhat.which
+			|| (!did.mapping.is_retroarch && did.is_controller))
+			continue;
+		int value = event.jhat.value;
+		if (did.is_controller) {
+			const Uint64 key = (static_cast<Uint64>(did.joystick_id) << 8) | event.jhat.hat;
+			auto& hat = osk_hats[key];
+			const int changed = hat.physical ^ value;
+			const int osk_owned = hat.physical & ~hat.gameplay;
+			hat.physical = value;
+			constexpr int bits[] = {SDL_HAT_UP, SDL_HAT_DOWN, SDL_HAT_LEFT, SDL_HAT_RIGHT};
+			for (int b = 0; b < 4; ++b) {
+				if (changed & bits[b])
+					handle_osk_button(did.joystick_id, SDL_GAMEPAD_BUTTON_DPAD_UP + b, (value & bits[b]) != 0);
+			}
+			// While captured, raw hats may only release guest-held directions.
+			// A diagonal snapshot must never assert an OSK-owned direction.
+			if (imgui_osk_should_render())
+				value &= hat.gameplay;
+			else
+				value &= ~osk_owned;
+			hat.gameplay = value;
+		}
+		read_joystick_hat(id, event.jhat.hat, value);
+		return;
 	}
 }
 
@@ -3431,20 +3652,39 @@ static bool handle_mouse_motion_event(const SDL_Event& event, const AmigaMonitor
 
 	const int midx = get_mouse_index_from_sdl_id(event.motion.which);
 
+#ifdef __ANDROID__
+	// SDL3 mouse motion is floating point, and the captured absolute-hover
+	// path (#2285) can deliver fractional deltas below one pixel per
+	// event. Keep the floats here so the accumulator in the relative
+	// dispatch below can carry the un-emitted fraction forward instead of
+	// truncating every event to zero.
+	float x = event.motion.x;
+	float y = event.motion.y;
+	float xrel = event.motion.xrel;
+	float yrel = event.motion.yrel;
+#else
 	int32_t x = event.motion.x;
 	int32_t y = event.motion.y;
 	int32_t xrel = event.motion.xrel;
 	int32_t yrel = event.motion.yrel;
+#endif
 
 	// HiDPI / Retina: scale from screen coordinates (points) to drawable pixels.
 	// Only needed for OpenGL path — SDL_RenderCoordinatesFromWindow handles this
 	// internally when the SDL renderer is active.
 	// Scale factors cached per-monitor in update_hidpi_scale(), updated on window resize.
 	if (!mon->amiga_renderer && mon->hidpi_needs_scaling) {
+#ifdef __ANDROID__
+		x *= mon->hidpi_scale_x;
+		xrel *= mon->hidpi_scale_x;
+		y *= mon->hidpi_scale_y;
+		yrel *= mon->hidpi_scale_y;
+#else
 		x = (int32_t)(x * mon->hidpi_scale_x);
 		xrel = (int32_t)(xrel * mon->hidpi_scale_x);
 		y = (int32_t)(y * mon->hidpi_scale_y);
 		yrel = (int32_t)(yrel * mon->hidpi_scale_y);
+#endif
 	}
 
 #ifndef LIBRETRO
@@ -3453,23 +3693,48 @@ static bool handle_mouse_motion_event(const SDL_Event& event, const AmigaMonitor
 		float rx, ry, rx0, ry0;
 		if (SDL_RenderCoordinatesFromWindow(mon->amiga_renderer, (float)x, (float)y, &rx, &ry)) {
 			SDL_RenderCoordinatesFromWindow(mon->amiga_renderer, (float)(x - xrel), (float)(y - yrel), &rx0, &ry0);
+#ifdef __ANDROID__
+			xrel = rx - rx0;
+			yrel = ry - ry0;
+			x = rx;
+			y = ry;
+#else
 			xrel = (int32_t)(rx - rx0);
 			yrel = (int32_t)(ry - ry0);
 			x = (int32_t)rx;
 			y = (int32_t)ry;
+#endif
 		}
 	}
 #endif
 
 	if (currprefs.input_tablet >= TABLET_MOUSEHACK)
 	{
+#ifdef __ANDROID__
+		// Absolute/tablet dispatch carries positions, not deltas; drop any
+		// pending relative residual so a mode switch back stays clean.
+		amiberry_android_mouse_delta(midx).reset();
+		setmousestate(midx, 0, static_cast<int32_t>(x), 1);
+		setmousestate(midx, 1, static_cast<int32_t>(y), 1);
+#else
 		setmousestate(midx, 0, x, 1);
 		setmousestate(midx, 1, y, 1);
+#endif
 	}
 	else
 	{
+#ifdef __ANDROID__
+		// Accumulate the fractional deltas and emit whole guest steps; the
+		// core applies input_mouse_speed on this relative path, so
+		// no speed scaling happens here.
+		const amiberry_mouse_delta whole =
+			amiberry_android_mouse_delta(midx).feed(xrel, yrel);
+		setmousestate(midx, 0, whole.dx, 0);
+		setmousestate(midx, 1, whole.dy, 0);
+#else
 		setmousestate(midx, 0, xrel, 0);
 		setmousestate(midx, 1, yrel, 0);
+#endif
 	}
 
 	return true;
@@ -3916,6 +4181,7 @@ static void process_event(const SDL_Event& event)
 		case SDL_EVENT_JOYSTICK_ADDED:
 			handle_joy_device_event(event.jdevice.which, false);
 			break;
+
 		case SDL_EVENT_JOYSTICK_REMOVED:
 			handle_joy_device_event(event.jdevice.which, true);
 			break;
@@ -4159,6 +4425,7 @@ int handle_msgpump(bool vblank)
 		got_event = 1;
 		process_event(event);
 	}
+	imgui_osk_update();
 	drain_pending_touch_neutralization();
 #ifdef __ANDROID__
 	amiberry_android_touch_mouse_tick();
@@ -4203,6 +4470,7 @@ bool handle_events()
 			{
 				process_event(event);
 			}
+			imgui_osk_update();
 		}
 
 		// Keyboard, mouse and joystick read events are handled in process_event in Amiberry
@@ -5437,7 +5705,8 @@ void target_fixup_options(uae_prefs* p)
 	}
 
 	if ((p->gfx_apmode[0].gfx_vsyncmode || p->gfx_apmode[1].gfx_vsyncmode)) {
-		if (p->produce_sound && sound_devices[p->soundcard]->type == SOUND_DEVICE_SDL2) {
+		if (p->produce_sound && sound_devices[p->soundcard]
+			&& sound_devices[p->soundcard]->type == SOUND_DEVICE_SDL) {
 			p->soundcard = 0;
 		}
 	}
@@ -5671,6 +5940,28 @@ void target_default_options(uae_prefs* p, const int type)
 	// Default IDs for ports 0 and 1: Mouse and first joystick
 	p->jports[0].id = JSEM_MICE;
 	p->jports[1].id = JSEM_JOYS;
+#ifndef LIBRETRO
+	// Global device choices are defaults for normal startup too, not just
+	// autobooted content. Keep IDs and config identities in sync so a later
+	// input fixup cannot restore an old device over the selected default.
+	const char* const devices[MAX_JPORTS] = {
+		amiberry_options.default_mouse1,
+		amiberry_options.default_controller1,
+		amiberry_options.default_controller3,
+		amiberry_options.default_controller4
+	};
+	const char* const fallbacks[MAX_JPORTS] = { "mouse", "joy0", "none", "none" };
+	for (int port = 0; port < MAX_JPORTS; ++port) {
+		const char* value = devices[port];
+		// Global option buffers are larger than the port's short ID buffer.
+		// Reject oversized values rather than truncating them into a new token.
+		if (!value[0] || strlen(value) >= sizeof p->jports[port].idc.shortid)
+			value = fallbacks[port];
+		p->jports[port].idc = {};
+		inputdevice_joyport_config_store(p, value, port, -1, -1, 0);
+		inputdevice_joyport_config(p, value, nullptr, port, -1, -1, 0, false);
+	}
+#endif
 
 	whdload_prefs.button_wait = amiberry_options.default_whd_buttonwait;
 	whdload_prefs.show_splash = amiberry_options.default_whd_showsplash;
@@ -6036,7 +6327,13 @@ static int target_parse_option_host(uae_prefs *p, const TCHAR *option, const TCH
 		|| cfgfile_string(option, value, _T("vkbd_language"), p->vkbd_language, sizeof p->vkbd_language)
 		|| cfgfile_string(option, value, _T("vkbd_style"), p->vkbd_style, sizeof p->vkbd_style)
 		|| cfgfile_string(option, value, _T("vkbd_toggle"), p->vkbd_toggle, sizeof p->vkbd_toggle))
+	{
+		// "default" resolves to the live emulator default, letting a launcher
+		// override reset a value explicitly set in a backing configuration.
+		if (_tcscmp(p->vkbd_toggle, _T("default")) == 0)
+			_tcscpy(p->vkbd_toggle, amiberry_options.default_vkbd_toggle);
 		return 1;
+	}
 
 	if (cfgfile_string(option, value, _T("expansion_gui_page"), tmpbuf, sizeof tmpbuf / sizeof(TCHAR))) {
 		TCHAR* p = _tcschr(tmpbuf, ',');
@@ -6964,6 +7261,9 @@ bool save_amiberry_settings_with_result()
 	// Default mouse input speed
 	write_int_option("input_default_mouse_speed", amiberry_options.input_default_mouse_speed);
 
+	// GUI scale as a percentage of automatic DPI scaling (100 = stock)
+	write_float_option("gui_layout_scale", amiberry_options.gui_layout_scale_percent);
+
 	// When using Keyboard as Joystick, stop any double keypresses
 	write_bool_option("input_keyboard_as_joystick_stop_keypresses", amiberry_options.input_keyboard_as_joystick_stop_keypresses);
 	
@@ -7099,6 +7399,7 @@ bool save_amiberry_settings_with_result()
 
 	// Default controller button for toggling the On-screen Keyboard
 	write_string_option("default_vkbd_toggle", amiberry_options.default_vkbd_toggle);
+	write_bool_option("default_vkbd_toggle_migrated", amiberry_options.default_vkbd_toggle_migrated);
 
 	// GUI Theme
 	write_string_option("gui_theme", amiberry_options.gui_theme);
@@ -7434,6 +7735,14 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_yesno(option, value, "read_config_descriptions", &amiberry_options.read_config_descriptions);
 		ret |= cfgfile_yesno(option, value, "write_logfile", &amiberry_options.write_logfile);
 		ret |= cfgfile_intval(option, value, "default_line_mode", &amiberry_options.default_line_mode, 1);
+		// Sanitize at the parse boundary: cfgfile_floatval stores the raw
+		// _tcstod result, so a hand-edited "nan" would otherwise reach (and be
+		// re-persisted from) the option verbatim. Seeding the local with the
+		// current value keeps the option untouched on non-matching lines; the
+		// clamp maps non-finite input to the stock 100%.
+		float parsed_gui_layout_scale = amiberry_options.gui_layout_scale_percent;
+		ret |= cfgfile_floatval(option, value, "gui_layout_scale", &parsed_gui_layout_scale);
+		amiberry_options.gui_layout_scale_percent = clamp_gui_layout_scale_percent(parsed_gui_layout_scale);
 		ret |= cfgfile_yesno(option, value, "rctrl_as_ramiga", &amiberry_options.rctrl_as_ramiga);
 		ret |= cfgfile_yesno(option, value, "gui_joystick_control", &amiberry_options.gui_joystick_control);
 		ret |= cfgfile_intval(option, value, "input_default_mouse_speed", &amiberry_options.input_default_mouse_speed, 1);
@@ -7489,7 +7798,8 @@ static int parse_amiberry_settings_line(const char *path, char *linea)
 		ret |= cfgfile_yesno(option, value, "default_vkbd_enabled", &amiberry_options.default_vkbd_enabled);
 		ret |= cfgfile_string(option, value, "default_vkbd_language", amiberry_options.default_vkbd_language, sizeof amiberry_options.default_vkbd_language);
 		ret |= cfgfile_intval(option, value, "default_vkbd_transparency", &amiberry_options.default_vkbd_transparency, 1);
-		ret |= cfgfile_string(option, value, "default_vkbd_toggle", amiberry_options.default_vkbd_toggle, sizeof amiberry_options.default_vkbd_toggle);
+		ret |= cfgfile_string(option, value, _T("default_vkbd_toggle"), amiberry_options.default_vkbd_toggle, sizeof amiberry_options.default_vkbd_toggle);
+		ret |= cfgfile_yesno(option, value, "default_vkbd_toggle_migrated", &amiberry_options.default_vkbd_toggle_migrated);
 		// Legacy bitmap vkbd defaults. Accept old amiberry.conf files, but do not apply or re-save these.
 		bool legacy_vkbd_bool;
 		char legacy_vkbd_string[128];
@@ -11549,8 +11859,25 @@ static void load_amiberry_settings_from_file(const std::string& settings_file)
 
 			parse_amiberry_settings_line(settings_file.c_str(), line_copy);
 		}
+
+#ifdef __ANDROID__
+		// One-time legacy migration, applied only after the whole file has been
+		// parsed so the migrated flag (serialized after the toggle) is already
+		// loaded: Guide is the Android menu trigger, so a persisted "guide" from
+		// a previous version is the stale default, never a working keyboard
+		// toggle. The flag is set after inspecting an unmarked file regardless
+		// of conversion, so a Guide value chosen deliberately afterwards is
+		// preserved on later launches.
+		if (!amiberry_options.default_vkbd_toggle_migrated)
+		{
+			if (_tcscmp(amiberry_options.default_vkbd_toggle, _T("guide")) == 0)
+				_tcscpy(amiberry_options.default_vkbd_toggle, _T("leftstick"));
+			amiberry_options.default_vkbd_toggle_migrated = true;
+		}
+#endif
 	}
 }
+
 
 void load_amiberry_settings()
 {
@@ -11822,6 +12149,28 @@ static void makeverstr(TCHAR* s)
 	}
 }
 
+// Resolve and load the bootstrap settings (amiberry.conf) for the early-exit
+// dump modes without creating or migrating anything, so --dump-paths and
+// --dump-config see the same path overrides a normal start would apply.
+static void resolve_and_load_bootstrap_settings_for_dump(const bool portable_mode)
+{
+	resolved_settings_source = amiberry_conf_file_overridden_from_cli
+		? settings_resolution_source::cli_override
+		: settings_resolution_source::default_paths_only;
+	const auto settings_file_for_resolution = get_existing_settings_file_for_resolution(portable_mode);
+	if (!settings_file_for_resolution.empty())
+	{
+		resolved_settings_file = normalize_path_string(settings_file_for_resolution);
+		if (!amiberry_conf_file_overridden_from_cli)
+		{
+			resolved_settings_source = path_strings_match(settings_file_for_resolution, amiberry_conf_file)
+				? settings_resolution_source::settings_dir
+				: settings_resolution_source::legacy_settings;
+		}
+		load_amiberry_settings_from_file(settings_file_for_resolution);
+	}
+}
+
 int amiberry_main(int argc, char* argv[])
 {
 #ifdef __ANDROID__
@@ -11847,6 +12196,7 @@ int amiberry_main(int argc, char* argv[])
 	bool run_jit_selftest = false;
 	bool run_path_migration_selftest = false;
 	bool dump_paths = false;
+	bool dump_config = false;
 	bool download_whdboot = false;
 	for (auto i = 1; i < argc; i++) {
 		if (_tcscmp(argv[i], _T("-h")) == 0 || _tcscmp(argv[i], _T("--help")) == 0)
@@ -11861,6 +12211,8 @@ int amiberry_main(int argc, char* argv[])
 			run_path_migration_selftest = true;
 		if (_tcscmp(argv[i], _T("--dump-paths")) == 0)
 			dump_paths = true;
+		if (_tcscmp(argv[i], _T("--dump-config")) == 0)
+			dump_config = true;
 		if (_tcscmp(argv[i], _T("--download-whdboot")) == 0)
 			download_whdboot = true;
 		if (_tcscmp(argv[i], _T("--rescan-roms")) == 0)
@@ -11868,6 +12220,13 @@ int amiberry_main(int argc, char* argv[])
 		if (_tcscmp(argv[i], _T("--perf-log")) == 0)
 			force_perf_log = true;
 	}
+	// write_log() console output goes to stdout, which would interleave with
+	// the serialized configuration; --log is therefore ignored in dump mode
+	// (file logging never initializes this early anyway). Reset it here,
+	// before any code path that can log.
+	if (dump_config)
+		console_logging = 0;
+	amiberry_dump_config_mode = dump_config;
 
 	if (run_jit_selftest)
 		return run_jit_selftest_cli();
@@ -11878,19 +12237,20 @@ int amiberry_main(int argc, char* argv[])
 	struct sigaction action{};
 #endif
 	mainthreadid = uae_thread_get_id(nullptr);
+	const bool early_dump_mode = dump_paths || dump_config;
 
 
 
 #ifdef USE_DBUS
-	if (!dump_paths)
+	if (!early_dump_mode)
 		DBusSetup();
 #endif
 #ifdef USE_IPC_SOCKET
-	if (!dump_paths)
+	if (!early_dump_mode)
 		Amiberry::IPC::IPCSetup();
 #endif
 
-	suppress_runtime_path_side_effects = dump_paths;
+	suppress_runtime_path_side_effects = early_dump_mode;
 
 	// Parse the command line to possibly set amiberry_config.
 	// Do not remove used args yet.
@@ -11911,27 +12271,83 @@ int amiberry_main(int argc, char* argv[])
 	g_portable_mode = false;
 	#endif
 	const bool portable_mode = g_portable_mode;
-	resolve_bootstrap_settings_paths(portable_mode, !dump_paths);
+	resolve_bootstrap_settings_paths(portable_mode, !early_dump_mode);
 	if (dump_paths)
 	{
 		init_amiberry_dirs(portable_mode, false);
-		resolved_settings_source = amiberry_conf_file_overridden_from_cli
-			? settings_resolution_source::cli_override
-			: settings_resolution_source::default_paths_only;
-		const auto settings_file_for_resolution = get_existing_settings_file_for_resolution(portable_mode);
-		if (!settings_file_for_resolution.empty())
-		{
-			resolved_settings_file = normalize_path_string(settings_file_for_resolution);
-			if (!amiberry_conf_file_overridden_from_cli)
-			{
-				resolved_settings_source = path_strings_match(settings_file_for_resolution, amiberry_conf_file)
-					? settings_resolution_source::settings_dir
-					: settings_resolution_source::legacy_settings;
-			}
-			load_amiberry_settings_from_file(settings_file_for_resolution);
-		}
+		resolve_and_load_bootstrap_settings_for_dump(portable_mode);
 		dump_resolved_paths(false);
 		return 0;
+	}
+	if (dump_config)
+	{
+		init_amiberry_dirs(portable_mode, false);
+		resolve_and_load_bootstrap_settings_for_dump(portable_mode);
+		// Mirror the first-run slow-host default a normal start applies after
+		// this early exit point: with no amiberry.conf on a known-slow SBC,
+		// resolution autoswitch is enabled before target_default_options()
+		// copies it into currprefs, so the dump must reflect it too.
+		if (!my_existsfile2(amiberry_conf_file.c_str()) && host_detect_slow_sbc())
+			amiberry_options.default_gfx_autoresolution = 1;
+		// default_prefs() dereferences the keyboard translation table that
+		// keyboard_settrans() installs later on a normal start; it has not run
+		// yet at this early exit point.
+		keyboard_settrans();
+		// Populate the ROM inventory from the existing DetectedROMs cache in
+		// amiberry.ini, read-only: --model presets and config loading resolve
+		// Kickstart paths through configure_rom(), which needs the inventory a
+		// normal start builds in initialize_ini(). A missing cache is left
+		// alone -- --dump-config must not write scan results back.
+		bool rom_inventory_available = false;
+		if (my_existsfile2(get_ini_file_path().c_str())) {
+			// recover_by_recreate=false: a malformed ini must be left
+			// untouched -- the normal self-heal deletes and recreates it,
+			// which a diagnostic command must never do.
+			reginitializeinit(&inipath, false);
+			if (regexiststree(nullptr, _T("DetectedROMs"))) {
+				// --rescan-roms asks for a cache refresh, which writes; the
+				// dump resolves against the existing cache instead, so the
+				// inventory is loaded even when a rescan was requested.
+				const int saved_forceroms = forceroms;
+				forceroms = 0;
+				read_rom_list(false);
+				forceroms = saved_forceroms;
+				rom_inventory_available = true;
+			}
+		}
+		if (!rom_inventory_available)
+			fprintf(stderr, "; no ROM inventory: amiberry.ini has no DetectedROMs cache (first run?).\n"
+				"; ROM-dependent settings resolve unselected until a normal launch scans once.\n");
+		// fixup_prefs() resolves gfx options through the enumerated display
+		// list (getdisplay() exits when no display was ever enumerated) and
+		// sound options through the enumerated sound device list. Enumerate
+		// for real when SDL is available; otherwise the synthetic primary
+		// display below lets headless hosts and CI runners resolve offline.
+		if (osdep_platform_init_sdl()) {
+			enumeratedisplays();
+			sortdisplays();
+			enumerate_sound_devices();
+		}
+		install_headless_display_fallback();
+		// Resolving a WHDLoad autoload in dump mode must not prepare the
+		// host for a real boot: no booter temp tree, no save-data links.
+		whdload_set_host_writes_enabled(false);
+		// drawbridge_update_profiles() skips floppybridge_init() while
+		// quitting, which is the code's own lever against probing bridge
+		// hardware; use it so the dump never touches attached devices.
+		quit_program = UAE_QUIT;
+		// RP9 media marked for deployment must not be copied into the
+		// persistent Shared tree by a diagnostic dump.
+		rp9_set_host_writes_enabled(false);
+		// Remove Amiberry's -o options so the core command line parser below
+		// sees the same argv a normal start would.
+		if (!parse_amiberry_cmd_line(&argc, argv, true))
+		{
+			printf("Error in Amiberry command line option parsing.\n");
+			usage();
+			abort();
+		}
+		return dump_config_and_exit(argc, argv);
 	}
 
 	if (!amiberry_conf_file_overridden_from_cli)
@@ -11952,6 +12368,15 @@ int amiberry_main(int argc, char* argv[])
 		// cpu_compatible case and only risks breaking timing-sensitive titles.)
 		amiberry_options.default_gfx_autoresolution = 1;
 	}
+
+#ifdef __ANDROID__
+	// First run with no amiberry.conf: nothing legacy to migrate. Marking now
+	// prevents the first save from persisting default_vkbd_toggle_migrated=no,
+	// which would let a deliberately chosen Guide value be treated as stale
+	// legacy on the next launch.
+	if (!config_found)
+		amiberry_options.default_vkbd_toggle_migrated = true;
+#endif
 	if (force_perf_log)
 		amiberry_options.perf_log = true;
 	quickstart_compa = amiberry_options.default_quickstart_compatibility;
@@ -12079,12 +12504,12 @@ int amiberry_main(int argc, char* argv[])
 	enumerate_sound_devices();
 	for (int i = 0; i < MAX_SOUND_DEVICES && sound_devices[i]; i++) {
 		const int type = sound_devices[i]->type;
-		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL2 ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), sound_devices[i]->name);
+		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), sound_devices[i]->name);
 	}
 	write_log(_T("Enumerating recording devices:\n"));
 	for (int i = 0; i < MAX_SOUND_DEVICES && record_devices[i]; i++) {
 		const int type = record_devices[i]->type;
-		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL2 ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), record_devices[i]->name);
+		write_log(_T("%d:%s: %s\n"), i, type == SOUND_DEVICE_SDL ? _T("SDL") : (type == SOUND_DEVICE_DS ? _T("DS") : (type == SOUND_DEVICE_AL ? _T("AL") : (type == SOUND_DEVICE_WASAPI ? _T("WA") : (type == SOUND_DEVICE_WASAPI_EXCLUSIVE ? _T("WX") : _T("PA"))))), record_devices[i]->name);
 	}
 	write_log(_T("Enumeration done\n"));
 

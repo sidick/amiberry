@@ -213,40 +213,48 @@ static int draco_keybord_repeat_cnt, draco_keybord_repeat_code;
 
 // OSK_* constants defined in imgui_osk.h
 
-// Accumulated OSK joystick state — directions and button are set/cleared
-// independently by different callers, so we track them across calls.
-static int osk_accumulated_state = 0;
+// Generic joystick mappings and directly routed gamepads contribute separately:
+// a gamepad release/removal must not clear a plain joystick's held OSK key.
+static int osk_joystick_state = 0;
+static int osk_gamepad_state = 0;
+static thread_local bool osk_passthrough = false;
 
-void osk_control(int x, int y, int button, int buttonstate)
+inputdevice_osk_passthrough::inputdevice_osk_passthrough(bool enabled)
+	: previous(osk_passthrough)
+{
+	osk_passthrough = previous || enabled;
+}
+
+inputdevice_osk_passthrough::~inputdevice_osk_passthrough()
+{
+	osk_passthrough = previous;
+}
+
+void osk_control(int x, int y, int button, int buttonstate, OskInputSource source)
 {
 	if (!imgui_osk_is_active()) {
-		osk_accumulated_state = 0;
+		osk_joystick_state = osk_gamepad_state = 0;
 		return;
 	}
-	if (vkbd_allowed(0))
-	{
-		// Update accumulated direction state: always refresh direction bits
-		if (!button) {
-			// Direction event: replace all direction bits
-			osk_accumulated_state &= ~(OSK_LEFT | OSK_RIGHT | OSK_UP | OSK_DOWN);
-			if (x < 0) osk_accumulated_state |= OSK_LEFT;
-			if (x > 0) osk_accumulated_state |= OSK_RIGHT;
-			if (y < 0) osk_accumulated_state |= OSK_UP;
-			if (y > 0) osk_accumulated_state |= OSK_DOWN;
-		} else {
-			// Button event: update button bit
-			if (buttonstate)
-				osk_accumulated_state |= OSK_BUTTON;
-			else
-				osk_accumulated_state &= ~OSK_BUTTON;
-		}
+	if (!vkbd_allowed(0))
+		return;
 
-		int code;
-		int pressed;
-		// imgui_osk_process handles inputdevice_do_keyboard internally
-		// via press_key/release_key — don't call it again here
-		imgui_osk_process(osk_accumulated_state, &code, &pressed);
+	int& state = source == OskInputSource::Gamepad ? osk_gamepad_state : osk_joystick_state;
+	if (!button) {
+		state &= ~(OSK_LEFT | OSK_RIGHT | OSK_UP | OSK_DOWN);
+		if (x < 0) state |= OSK_LEFT;
+		if (x > 0) state |= OSK_RIGHT;
+		if (y < 0) state |= OSK_UP;
+		if (y > 0) state |= OSK_DOWN;
+	} else if (buttonstate) {
+		state |= OSK_BUTTON;
+	} else {
+		state &= ~OSK_BUTTON;
 	}
+
+	int code, pressed;
+	// The OSK emits keyboard events itself; do not emit them a second time.
+	imgui_osk_process(osk_joystick_state | osk_gamepad_state, &code, &pressed);
 }
 
 static int isdevice (struct uae_input_device *id)
@@ -2658,6 +2666,13 @@ static void mousehack_reset (void)
 	}
 	mousehack_address = 0;
 	mousehack_enabled = false;
+	lastmx = -1;
+	lastmy = -1;
+}
+
+bool mousehack_pending(void)
+{
+	return mousehack_address != 0;
 }
 
 static bool mousehack_enable (void)
@@ -2720,10 +2735,12 @@ void input_mousehack_cursor_hotspot(int cursor_width, int cursor_height, int* ho
 	amiberry_input_mousehack_cursor_hotspot(mouseoffset_x, mouseoffset_y, cursor_width, cursor_height,
 		hotspot_x, hotspot_y);
 	if (residual_x) {
-		*residual_x = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_x, cursor_width, 1);
+		*residual_x = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_x, cursor_width,
+			amiberry_mousehack_pointer_bias_x);
 	}
 	if (residual_y) {
-		*residual_y = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_y, cursor_height, 2);
+		*residual_y = amiberry_input_mousehack_hotspot_residual_axis(mouseoffset_y, cursor_height,
+			amiberry_mousehack_pointer_bias_y);
 	}
 }
 
@@ -2844,7 +2861,7 @@ void mousehack_wakeup(void)
 int input_mousehack_status(TrapContext *ctx, int mode, uaecptr diminfo, uaecptr dispinfo, uaecptr vp, uae_u32 moffset)
 {
 	if (mode == 4) {
-		return mousehack_enable () ? 1 : 0;
+		return 1; // allow pending mousehack task, mousehack can be enabled and disabled on the fly.
 	} else if (mode == 5) {
 		mousehack_address = (trap_get_dreg(ctx, 0) & 0xffff) + rtarea_bank.baseaddr;
 		mousehack_enable ();
@@ -2854,7 +2871,7 @@ int input_mousehack_status(TrapContext *ctx, int mode, uaecptr diminfo, uaecptr 
 			uae_u8 v = get_byte_host(mousehack_address + MH_E);
 			v |= 0x40;
 			put_byte_host(mousehack_address + MH_E, v);
-			write_log (_T("Tablet driver running (%p,%02x)\n"), mousehack_address, v);
+			write_log(_T("Virtual mouse driver running (%p,%02x)\n"), mousehack_address, v);
 		}
 	} else if (mode == 1) {
 		int x1 = -1, y1 = -1, x2 = -1, y2 = -1;
@@ -3429,7 +3446,19 @@ static void mousehack_helper (uae_u32 buttonmask)
 	if (quit_program) {
 		return;
 	}
+
+	// The virtual mouse driver must actually be in use. The guest driver task
+	// is installed unconditionally since "support virtual mouse driver on the
+	// fly change" (it no longer gates on this trap returning 0), so feeding it
+	// events with magic mouse alone would move the guest pointer to the stale
+	// lastmx/lastmy (0,0 after startup) on every button event.
+	if (currprefs.input_tablet == TABLET_OFF) {
+		return;
+	}
 	if (!(currprefs.input_mouse_untrap & MOUSEUNTRAP_MAGIC) && currprefs.input_tablet < TABLET_MOUSEHACK) {
+		return;
+	}
+	if (lastmx < 0 || lastmy < 0) {
 		return;
 	}
 
@@ -3747,6 +3776,7 @@ static void mouseupdate (int pct, bool vsync)
 	}
 
 	for (int i = 0; i < 2; i++) {
+
 		if (lightpen_delta[i][0]) {
 			lightpen_x[i] += lightpen_delta[i][0];
 			if (!lightpen_deltanoreset[i][0])
@@ -5745,8 +5775,8 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 	case 4: /* ->Parallel port joystick adapter port #2 */
 		joy = ie->unit - 1;
 		if (ie->type & 4) {
-			if (vkbd_allowed(0) && imgui_osk_is_active()) {
-				osk_control(0, 0, 1 << ie->data, state);
+			if (!osk_passthrough && vkbd_allowed(0) && imgui_osk_is_active()) {
+				osk_control(0, 0, 1 << ie->data, state, OskInputSource::EmulatedJoystick);
 			}
 			else {
 				int old = joybutton[joy] & (1 << ie->data);
@@ -5996,13 +6026,13 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 			}
 			mouse_deltanoreset[joy][0] = 1;
 			mouse_deltanoreset[joy][1] = 1;
-			if (vkbd_allowed(0) && imgui_osk_is_active()) {
+			if (!osk_passthrough && vkbd_allowed(0) && imgui_osk_is_active()) {
 				int dx = 0, dy = 0;
 				if (left) dx = -1;
 				else if (right) dx = 1;
 				if (top) dy = -1;
 				else if (bot) dy = 1;
-				osk_control(dx, dy, 0, 0);
+				osk_control(dx, dy, 0, 0, OskInputSource::EmulatedJoystick);
 			}
 			else {
 				joydir[joy] = 0;
@@ -6104,7 +6134,26 @@ static void inputdevice_checkconfig (void)
 			currprefs.input_autoswitch = changed_prefs.input_autoswitch;
 			currprefs.input_autoswitchleftright = changed_prefs.input_autoswitchleftright;
 			currprefs.input_device_match_mask = changed_prefs.input_device_match_mask;
-			currprefs.input_tablet = changed_prefs.input_tablet;
+
+			if (currprefs.input_tablet != changed_prefs.input_tablet) {
+				currprefs.input_tablet = changed_prefs.input_tablet;
+				if (mousehack_address) {
+					// Sync Amiga side mousehack task status.
+					uae_u8 status = get_byte_host(mousehack_address + MH_E);
+					bool act = currprefs.input_tablet != 0;
+					if (status & 0x40) {
+						if (act != ((status & 0x80) != 0)) {
+							uae_u8 newstatus = status & ~0x80;
+							if (act) {
+								newstatus |= 0x80;
+							}
+							if (status != newstatus) {
+								put_byte_host(mousehack_address + MH_E, newstatus);
+							}
+						}
+					}
+				}
+			}
 
 			inputdevice_updateconfig (&changed_prefs, &currprefs);
 			if (refresh_tablet_session)
@@ -6195,6 +6244,8 @@ void inputdevice_reset (void)
 #ifdef WITH_DRACO
 	draco_keybord_repeat_cnt = 0;
 #endif
+	lastmx = -1;
+	lastmy = -1;
 }
 
 static int getoldport (struct uae_input_device *id)
@@ -10202,6 +10253,40 @@ uae_u32 getmousebuttonstate (int mouse)
 /* same for joystick axis (analog or digital)
 * (0 = center, -max = full left/top, max = full right/bottom)
 */
+bool inputdevice_is_joystick_axis_active(int joy, int axis, int state, int max)
+{
+	if (!joysticks)
+		return false;
+	const auto& id = joysticks[joy];
+	if (!id.enabled || input_play || testmode || state == 0)
+		return false;
+	// setjoystickstate applies this filter before dispatching any binding.
+	const int deadzone = currprefs.input_joymouse_deadzone * max / 100;
+	const int magnitude = abs(state);
+	if (magnitude < deadzone)
+		return false;
+	for (int sub = 0; sub < MAX_INPUT_SUB_EVENT; ++sub) {
+		const int event = id.eventid[ID_AXIS_OFFSET + axis][sub];
+		if (event <= 0)
+			continue;
+		const auto& ie = events[event];
+		const bool joyport = ie.unit >= 1 && ie.unit <= 4;
+		if (joyport && ie.type == 0) {
+			// Digital joystick axes have a second, independently configured filter.
+			if (magnitude >= currprefs.input_joystick_deadzone * max / 100)
+				return true;
+		} else if ((joyport && (ie.type & (8 | 128)))
+			|| ((ie.unit == 5 || ie.unit == 6) && ie.type == 0)) {
+			// Mouse, paddle and lightpen axes include the boundary in neutral.
+			if (magnitude > deadzone)
+				return true;
+		} else {
+			return true;
+		}
+	}
+	return false;
+}
+
 void setjoystickstate (int joy, int axis, int state, int max)
 {
 	struct uae_input_device *id = &joysticks[joy];

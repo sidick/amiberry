@@ -76,7 +76,8 @@ extern uae_u8 agnus_hpos;
 #define BLIT_NASTY_CPU_STEAL_CYCLE_COUNT 3
 
 /* we must not change ce-mode while blitter is running.. */
-static int blitter_cycle_exact, immediate_blits;
+bool blitter_cycle_exact;
+static int immediate_blits;
 static int blt_statefile_type;
 
 static uae_u16 bltcon0_next, bltcon1_next;
@@ -132,6 +133,8 @@ static uae_u32 debug_bltpc;
 static int debug_bltcop;
 static uae_u16 debug_bltsizev, debug_bltsizeh;
 static uae_u16 debug_bltadat, debug_bltbdat, debug_bltcdat;
+
+static void blitter_handler(uae_u32 data);
 
 #define BLITTER_MAX_PIPELINED_CYCLES 4
 
@@ -436,7 +439,7 @@ static void blitter_end(void)
 {
 	blt_info.blit_main = 0;
 	blt_info.blit_queued = 0;
-	event2_remevent(ev2_blitter);
+	event2_newevent_x_remove(blitter_handler);
 	unset_special(SPCFLAG_BLTNASTY);
 #if BLITTER_DEBUG
 	if (log_blitter & 1) {
@@ -977,6 +980,7 @@ static void actually_do_blit(void)
 
 static void blitter_doit(void)
 {
+	blt_info.blit_stuck = 0;
 	if (blt_info.vblitsize == 0) {
 		blitter_done_all(true);
 		return;
@@ -995,25 +999,31 @@ static int makebliteventtime(int delay)
 	return delay;
 }
 
-void blitter_handler(uae_u32 data)
+void blitter_hsync(void)
 {
-	static int blitter_stuck;
-
-	if (!dmaen (DMA_BLITTER)) {
-		event2_newevent (ev2_blitter, 10, 0);
-		blitter_stuck++;
-		if (blitter_stuck < 20000 || !immediate_blits)
-			return; /* gotta come back later. */
-		/* "free" blitter in immediate mode if it has been "stuck" ~3 frames
-		* fixes some JIT game incompatibilities
-		*/
+	/* "free" blitter in immediate mode if it has been "stuck"
+	 *  ~3 frames fixes some JIT game incompatibilities.
+	 */
+	if (blt_info.blit_stuck > 0) {
+		blt_info.blit_stuck--;
+		if (!blt_info.blit_stuck) {
 #ifdef DEBUGGER
-		debugtest (DEBUGTEST_BLITTER, _T("force-unstuck!\n"));
+			debugtest(DEBUGTEST_BLITTER, _T("force-unstuck!\n"));
 #endif
+			blitter_doit();
+		}
 	}
-	blitter_stuck = 0;
+}
+
+static void blitter_handler(uae_u32 data)
+{
+	// blitter_handler is not use in CE mode.
+	if (!dmaen(DMA_BLITTER)) {
+		blt_info.blit_stuck = immediate_blits ? 1000 : -1;
+		return;
+	}
 	if (blit_slowdown > 0 && !immediate_blits) {
-		event2_newevent (ev2_blitter, makebliteventtime(blit_slowdown), 0);
+		event2_newevent_xx(-1, makebliteventtime(blit_slowdown), 0, blitter_handler);
 		blit_slowdown = -1;
 		return;
 	}
@@ -1631,10 +1641,9 @@ void process_blitter(struct rgabuf *rga)
 
 			// copper conflict: after blitter dma transfer,
 			// copy new copper pointer to conflicting blitter address pointer.
-			if (rga->conflict) {
-				rga->p = rga->conflict;
-				*rga->p = rga->conflictaddr;
-				rga->pv = rga->conflictaddr;
+			if (rga->conflict && rga->conflict2) {
+				uaecptr addr = copper_blitter_conflict(rga);
+				*rga->conflict2 = addr;
 			}
 		} else {
 			markidlecycle();
@@ -1672,10 +1681,9 @@ void process_blitter(struct rgabuf *rga)
 
 		// copper conflict: after blitter dma transfer,
 		// copy new copper pointer to conflicting blitter address pointer OR used modulo (if any)
-		if (rga->conflict) {
-			rga->p = rga->conflict;
-			*rga->p = rga->conflictaddr | rga->bltmod;
-			rga->pv = rga->conflictaddr | rga->bltmod;
+		if (rga->conflict && rga->conflict2) {
+			uaecptr addr = copper_blitter_conflict(rga);
+			*rga->conflict2 = addr;
 		}
 
 	}
@@ -2052,6 +2060,7 @@ void do_blitter(int copper, uaecptr pc)
 	blt_info.blit_pending = 1;
 	blt_info.blit_count_done = 0;
 	blt_info.blit_queued = 0;
+	blt_info.blit_stuck = 0;
 
 	blitter_start_init();
 
@@ -2148,7 +2157,7 @@ void do_blitter(int copper, uaecptr pc)
 	}
 	
 	blit_cyclecounter = cycles * blit_cyclecount;
-	event2_newevent (ev2_blitter, makebliteventtime(blit_cyclecounter), 0);
+	event2_newevent_xx(-1, makebliteventtime(blit_cyclecounter), 0, blitter_handler);
 }
 
 void blitter_check_start (void)
@@ -2160,6 +2169,9 @@ void blitter_check_start (void)
 		if (immediate_blits) {
 			blitter_doit();
 		}
+	}
+	if (blt_info.blit_stuck) {
+		blitter_doit();
 	}
 }
 
@@ -2308,6 +2320,7 @@ void blitter_reset(void)
 	blt_info.blit_pending = 0;
 	blt_info.blit_queued = 0;
 	blt_info.blit_count_done = 0;
+	blt_info.blit_stuck = 0;
 #if BLIT_TRACE == 1
 	bdp = blit_tracer;
 #endif
@@ -2434,10 +2447,10 @@ uae_u8 *restore_blitter_new(uae_u8 *src)
 	uae_u8 state, tmp;
 
 	blt_statefile_type = 1;
-	blitter_cycle_exact = restore_u8();
-	if (blitter_cycle_exact & 2) {
+	tmp = restore_u8();
+	if (tmp & 2) {
 		blt_statefile_type = 2;
-		blitter_cycle_exact = 1;
+		blitter_cycle_exact = true;
 	}
 
 	state = restore_u8();

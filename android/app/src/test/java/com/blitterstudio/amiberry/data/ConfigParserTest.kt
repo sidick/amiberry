@@ -34,6 +34,24 @@ class ConfigParserTest {
 	}
 
 	@Test
+	fun `parse input reads vkbd toggle`() {
+		val file = writeConfig("amiberry.vkbd_toggle=rightstick")
+		val result = ConfigParser.parse(file)
+
+		assertEquals("rightstick", result.settings.onScreenKeyboardToggle)
+		assertTrue(result.unknownLines.isEmpty())
+	}
+
+	@Test
+	fun `parse input keeps explicitly empty vkbd toggle distinct from absent`() {
+		val file = writeConfig("amiberry.vkbd_toggle=")
+		assertEquals("", ConfigParser.parse(file).settings.onScreenKeyboardToggle)
+
+		file.writeText("amiberry.vkbd_enabled=true")
+		assertNull(ConfigParser.parse(file).settings.onScreenKeyboardToggle)
+	}
+
+	@Test
 	fun `parse nonexistent file returns defaults`() {
 		val file = File(tempDir.root, "nonexistent.uae")
 		val result = ConfigParser.parse(file)
@@ -261,6 +279,21 @@ class ConfigParserTest {
 		assertEquals("onscreen_joy", s.joyport1)
 		assertTrue(s.onScreenJoystick)
 		assertFalse(s.onScreenKeyboard)
+	}
+
+	@Test
+	fun `parse input reads analog mouse map keys`() {
+		val file = writeConfig("""
+			joyport0=mouse
+			joyport1=joy0
+			joyport1mousemap=1
+		""".trimIndent())
+		val result = ConfigParser.parse(file)
+
+		assertFalse(result.settings.joyport0MouseMap)
+		assertTrue(result.settings.joyport1MouseMap)
+		assertTrue("joyport1mousemap" in result.explicitKeys)
+		assertTrue(result.unknownLines.none { it.trimStart().startsWith("joyport1mousemap=") })
 	}
 
 	@Test

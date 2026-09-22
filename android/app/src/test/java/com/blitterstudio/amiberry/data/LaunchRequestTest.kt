@@ -126,10 +126,38 @@ class LaunchRequestTest {
 				"-s", "amiberry.vkbd_enabled=true",
 				"-s", "amiberry.vkbd_numpad=true",
 				"-s", "input.default_osk=true",
+				"-s", "amiberry.vkbd_toggle=default",
+				"-s", "joyport0mousemap=0",
+				"-s", "joyport1mousemap=0",
 				"-G"
 			),
 			args
 		)
+	}
+
+	@Test
+	fun `android control overrides include vkbd toggle when set`() {
+		val args = LaunchRequest.AndroidControlOverrides(
+			joyport0 = "mouse",
+			joyport1 = "joy0",
+			onScreenJoystick = false,
+			onScreenKeyboard = true,
+			onScreenKeyboardToggle = "rightstick"
+		).toArgs()
+
+		assertTrue(args.contains("amiberry.vkbd_toggle=rightstick"))
+	}
+
+	@Test
+	fun `android control overrides emit default reset sentinel when toggle unset`() {
+		val args = LaunchRequest.AndroidControlOverrides(
+			joyport0 = "mouse",
+			joyport1 = "joy0",
+			onScreenJoystick = false,
+			onScreenKeyboard = true
+		).toArgs()
+
+		assertTrue(args.contains("amiberry.vkbd_toggle=default"))
 	}
 
 	@Test
@@ -204,6 +232,9 @@ class LaunchRequestTest {
 				"-s", "amiberry.vkbd_enabled=false",
 				"-s", "amiberry.vkbd_numpad=false",
 				"-s", "input.default_osk=false",
+				"-s", "amiberry.vkbd_toggle=default",
+				"-s", "joyport0mousemap=0",
+				"-s", "joyport1mousemap=0",
 				"-G"
 			),
 			args
@@ -236,6 +267,44 @@ class LaunchRequestTest {
 				"-s", "amiberry.vkbd_enabled=true",
 				"-s", "amiberry.vkbd_numpad=true",
 				"-s", "input.default_osk=true",
+				"-s", "amiberry.vkbd_toggle=default",
+				"-s", "joyport0mousemap=0",
+				"-s", "joyport1mousemap=0",
+				"-G"
+			),
+			args
+		)
+	}
+
+	@Test
+	fun `saved config request applies enabled mouse map overrides`() {
+		val configPath = "/tmp/saved.uae"
+
+		val args = LaunchRequest.SavedConfig(
+			configPath = configPath,
+			controlOverrides = LaunchRequest.AndroidControlOverrides(
+				joyport0 = "mouse",
+				joyport1 = "joy0",
+				onScreenJoystick = false,
+				onScreenKeyboard = true,
+				joyport1MouseMap = true
+			),
+			skipGui = true
+		).toArgs()
+
+		assertArrayEquals(
+			arrayOf(
+				"--rescan-roms",
+				"--config", configPath,
+				"-s", "joyport0=mouse",
+				"-s", "joyport1=joy0",
+				"-s", "amiberry.onscreen_joystick=false",
+				"-s", "amiberry.vkbd_enabled=true",
+				"-s", "amiberry.vkbd_numpad=false",
+				"-s", "input.default_osk=true",
+				"-s", "amiberry.vkbd_toggle=default",
+				"-s", "joyport0mousemap=0",
+				"-s", "joyport1mousemap=1",
 				"-G"
 			),
 			args
