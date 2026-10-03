@@ -20,6 +20,7 @@
 #include "filesys.h"
 #include "gui.h"
 #include "custom.h"
+#include "amiga_constants.h"
 #include "gui/gui_handling.h"
 #include "newcpu.h"
 #include "blitter.h"
@@ -52,6 +53,7 @@ using namespace Amiberry::IPC;
 // Socket state
 static int server_socket = -1;
 static std::string socket_path;
+static int socket_instance = 0;
 static bool ipc_active = false;
 static bool ipc_quit_requested = false;
 static std::mutex ipc_handle_mutex;
@@ -211,14 +213,18 @@ static std::string guarded_input_response(
 // Command handlers - reusing logic from DBus implementation
 static std::string HandleQuit(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUIT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUIT" << std::endl;
+	}
 	ipc_quit_requested = true;
 	return make_response(true);
 }
 
 static std::string HandlePause(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received PAUSE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received PAUSE" << std::endl;
+	}
 	setpaused(3);
 	activationtoggle(0, true);
 	return make_response(true);
@@ -226,7 +232,9 @@ static std::string HandlePause(const std::vector<std::string>& args)
 
 static std::string HandleResume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RESUME" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RESUME" << std::endl;
+	}
 	resumepaused(3);
 	activationtoggle(0, false);
 	return make_response(true);
@@ -234,7 +242,9 @@ static std::string HandleResume(const std::vector<std::string>& args)
 
 static std::string HandleReset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RESET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RESET" << std::endl;
+	}
 	bool hard = false;
 	bool keyboard = true;
 
@@ -256,7 +266,9 @@ static std::string HandleReset(const std::vector<std::string>& args)
 
 static std::string HandleScreenshot(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SCREENSHOT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SCREENSHOT" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing filename"});
 	}
@@ -297,7 +309,9 @@ static std::string HandleScreenshot(const std::vector<std::string>& args)
 
 static std::string HandleSavestate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SAVESTATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SAVESTATE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SAVESTATE <statefile> <configfile>"});
 	}
@@ -313,7 +327,9 @@ static std::string HandleSavestate(const std::vector<std::string>& args)
 
 static std::string HandleLoadState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LOADSTATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LOADSTATE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing state file path"});
 	}
@@ -325,7 +341,9 @@ static std::string HandleLoadState(const std::vector<std::string>& args)
 
 static std::string HandleDiskSwap(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISKSWAP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISKSWAP" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: DISKSWAP <disknum> <drivenum>"});
 	}
@@ -354,7 +372,9 @@ static std::string HandleDiskSwap(const std::vector<std::string>& args)
 
 static std::string HandleQueryDiskSwap(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUERYDISKSWAP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUERYDISKSWAP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: QUERYDISKSWAP <drivenum>"});
 	}
@@ -383,7 +403,9 @@ static std::string HandleQueryDiskSwap(const std::vector<std::string>& args)
 
 static std::string HandleInsertFloppy(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERTFLOPPY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERTFLOPPY" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: INSERTFLOPPY <path> <drivenum>"});
 	}
@@ -409,7 +431,9 @@ static std::string HandleInsertFloppy(const std::vector<std::string>& args)
 
 static std::string HandleInsertCD(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERTCD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERTCD" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing CD image path"});
 	}
@@ -425,7 +449,9 @@ static std::string HandleInsertCD(const std::vector<std::string>& args)
 
 static std::string HandleGetStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_STATUS" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	responses.push_back(std::string("Paused=") + (pause_emulation ? "true" : "false"));
@@ -441,7 +467,9 @@ static std::string HandleGetStatus(const std::vector<std::string>& args)
 
 static std::string HandleGetConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CONFIG" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing option name"});
 	}
@@ -488,6 +516,20 @@ static std::string HandleGetConfig(const std::vector<std::string>& args)
 		value = std::to_string(changed_prefs.gfx_monitor[0].gfx_size_win.height);
 	} else if (optname == "gfx_fullscreen") {
 		value = changed_prefs.gfx_apmode[0].gfx_fullscreen ? "true" : "false";
+	} else if (optname == "gfx_auto_crop") {
+		value = changed_prefs.gfx_auto_crop ? "true" : "false";
+	} else if (optname == "gfx_manual_crop") {
+		value = changed_prefs.gfx_manual_crop ? "true" : "false";
+	} else if (optname == "gfx_manual_crop_width") {
+		value = std::to_string(changed_prefs.gfx_manual_crop_width);
+	} else if (optname == "gfx_manual_crop_height") {
+		value = std::to_string(changed_prefs.gfx_manual_crop_height);
+	} else if (optname == "gfx_horizontal_offset") {
+		value = std::to_string(changed_prefs.gfx_horizontal_offset);
+	} else if (optname == "gfx_vertical_offset") {
+		value = std::to_string(changed_prefs.gfx_vertical_offset);
+	} else if (optname == "gfx_overscanmode") {
+		value = std::to_string(changed_prefs.gfx_overscanmode);
 	}
 	// Sound options
 	else if (optname == "sound_output") {
@@ -548,7 +590,9 @@ static std::string HandleGetConfig(const std::vector<std::string>& args)
 
 static std::string HandleSetConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CONFIG" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_CONFIG <option> <value>"});
 	}
@@ -576,8 +620,61 @@ static std::string HandleSetConfig(const std::vector<std::string>& args)
 			changed_prefs.gfx_apmode[0].gfx_fullscreen = fullscreen ? GFX_FULLWINDOW : GFX_WINDOW;
 			set_config_changed();
 		}
-		// Sound options
-		else if (optname == "sound_output") {
+		// Crop options — enabling one mode disables the other
+		else if (optname == "gfx_auto_crop") {
+			const bool enable = (optval == "true" || optval == "1");
+			changed_prefs.gfx_auto_crop = enable;
+			if (enable) {
+				changed_prefs.gfx_manual_crop = false;
+			}
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop") {
+			const bool enable = (optval == "true" || optval == "1");
+			changed_prefs.gfx_manual_crop = enable;
+			if (enable) {
+				changed_prefs.gfx_auto_crop = false;
+			}
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop_width") {
+			// Clamp on the parsed long before narrowing and to the same
+			// native bounds the Filter panel uses, so a headless client
+			// cannot set a crop larger than the surface.
+			const long max_w = AMIGA_WIDTH_MAX << changed_prefs.gfx_resolution;
+			changed_prefs.gfx_manual_crop_width = static_cast<int>(
+				std::clamp(std::stol(optval), 0L, max_w));
+			set_config_changed();
+		}
+		else if (optname == "gfx_manual_crop_height") {
+			const long max_h = AMIGA_HEIGHT_MAX << changed_prefs.gfx_vresolution;
+			changed_prefs.gfx_manual_crop_height = static_cast<int>(
+				std::clamp(std::stol(optval), 0L, max_h));
+			set_config_changed();
+		}
+		else if (optname == "gfx_horizontal_offset") {
+			const long max_w = AMIGA_WIDTH_MAX << changed_prefs.gfx_resolution;
+			changed_prefs.gfx_horizontal_offset = static_cast<int>(
+				std::clamp(std::stol(optval), -max_w, max_w));
+			set_config_changed();
+		}
+		else if (optname == "gfx_vertical_offset") {
+			const long max_h = AMIGA_HEIGHT_MAX << changed_prefs.gfx_vresolution;
+			changed_prefs.gfx_vertical_offset = static_cast<int>(
+				std::clamp(std::stol(optval), -max_h, max_h));
+			set_config_changed();
+		}
+		else if (optname == "gfx_overscanmode") {
+			// Validate on the parsed long before narrowing; on LP64 an
+			// out-of-range value would otherwise wrap into a valid mode.
+			const long mode = std::stol(optval);
+			// Keep in sync with the overscan_items table in the Display panel.
+			if (mode < 0 || mode > 8) {
+				return make_response(false, {"Invalid gfx_overscanmode (use 0-8)"});
+			}
+			changed_prefs.gfx_overscanmode = static_cast<int>(mode);
+			set_config_changed();
+		} else if (optname == "sound_output") {
 			changed_prefs.produce_sound = std::stol(optval);
 			set_config_changed();
 		} else if (optname == "sound_stereo") {
@@ -637,7 +734,9 @@ static std::string HandleSetConfig(const std::vector<std::string>& args)
 
 static std::string HandleLoadConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LOAD_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LOAD_CONFIG" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Missing config file path"});
 	}
@@ -653,7 +752,9 @@ static std::string HandleLoadConfig(const std::vector<std::string>& args)
 
 static std::string HandleSendKey(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_KEY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_KEY" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SEND_KEY <keycode> <state>"});
 	}
@@ -673,7 +774,9 @@ static std::string HandleSendKey(const std::vector<std::string>& args)
 
 static std::string HandleReadMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received READ_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received READ_MEM " << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: READ_MEM <address> <width(1,2,4)>"});
 	}
@@ -703,7 +806,9 @@ static std::string HandleReadMem(const std::vector<std::string>& args)
 
 static std::string HandleWriteMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received WRITE_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received WRITE_MEM " << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: WRITE_MEM <address> <width(1,2,4)> <value>"});
 	}
@@ -736,7 +841,9 @@ static std::string HandleWriteMem(const std::vector<std::string>& args)
 
 static std::string HandleEjectFloppy(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_FLOPPY" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_FLOPPY" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: EJECT_FLOPPY <drivenum>"});
 	}
@@ -758,7 +865,9 @@ static std::string HandleEjectFloppy(const std::vector<std::string>& args)
 
 static std::string HandleEjectCD(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_CD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_CD" << std::endl;
+	}
 
 	changed_prefs.cdslots[0].name[0] = 0;
 	changed_prefs.cdslots[0].inuse = false;
@@ -769,7 +878,9 @@ static std::string HandleEjectCD(const std::vector<std::string>& args)
 
 static std::string HandleSetVolume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_VOLUME" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_VOLUME" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_VOLUME <0-100>"});
 	}
@@ -793,34 +904,44 @@ static std::string HandleSetVolume(const std::vector<std::string>& args)
 
 static std::string HandleGetVolume(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_VOLUME" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_VOLUME" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.sound_volume_master)});
 }
 
 static std::string HandleMute(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received MUTE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received MUTE" << std::endl;
+	}
 	set_volume(0, 1);
 	return make_response(true);
 }
 
 static std::string HandleUnmute(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received UNMUTE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received UNMUTE" << std::endl;
+	}
 	set_volume(currprefs.sound_volume_master, 0);
 	return make_response(true);
 }
 
 static std::string HandleToggleFullscreen(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_FULLSCREEN" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_FULLSCREEN" << std::endl;
+	}
 	toggle_fullscreen(0, -1);
 	return make_response(true);
 }
 
 static std::string HandleSetWarp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_WARP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_WARP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_WARP <0|1>"});
 	}
@@ -838,13 +959,17 @@ static std::string HandleSetWarp(const std::vector<std::string>& args)
 
 static std::string HandleGetWarp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WARP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WARP" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.turbo_emulation ? 1 : 0)});
 }
 
 static std::string HandleGetVersion(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_VERSION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_VERSION" << std::endl;
+	}
 	std::vector<std::string> info;
 	info.push_back("version=" + get_version_string());
 	info.push_back("sdl=" + get_sdl_version_string());
@@ -853,7 +978,9 @@ static std::string HandleGetVersion(const std::vector<std::string>& args)
 
 static std::string HandleListFloppies(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_FLOPPIES" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_FLOPPIES" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	for (int i = 0; i < 4; ++i) {
@@ -871,7 +998,9 @@ static std::string HandleListFloppies(const std::vector<std::string>& args)
 
 static std::string HandleListConfigs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_CONFIGS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_CONFIGS" << std::endl;
+	}
 	std::vector<std::string> configs;
 
 	std::string config_path = get_configuration_path();
@@ -897,7 +1026,9 @@ static std::string HandleListConfigs(const std::vector<std::string>& args)
 
 static std::string HandleFrameAdvance(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received FRAME_ADVANCE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received FRAME_ADVANCE" << std::endl;
+	}
 	if (!pause_emulation) {
 		return make_response(false, {"Emulation must be paused first"});
 	}
@@ -925,7 +1056,9 @@ static std::string HandleFrameAdvance(const std::vector<std::string>& args)
 
 static std::string HandleSetMouseSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_MOUSE_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_MOUSE_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_MOUSE_SPEED <10-200>"});
 	}
@@ -949,7 +1082,9 @@ static std::string HandleSetMouseSpeed(const std::vector<std::string>& args)
 
 static std::string HandleSendMouse(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE" << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: SEND_MOUSE <dx> <dy> <buttons>"});
 	}
@@ -977,7 +1112,9 @@ static std::string HandleSendMouse(const std::vector<std::string>& args)
 
 static std::string HandleSendMouseAbs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE_ABS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE_ABS" << std::endl;
+	}
 	if (args.size() < 3) {
 		return make_response(false, {"Usage: SEND_MOUSE_ABS <x> <y> <buttons>"});
 	}
@@ -1009,7 +1146,9 @@ static std::string HandleSendMouseAbs(const std::vector<std::string>& args)
 static std::string HandleGetGuiAutomationState(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_GUI_AUTOMATION_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_GUI_AUTOMATION_STATE" << std::endl;
+	}
 	if (!args.empty())
 		return make_response(false, {"Usage: GET_GUI_AUTOMATION_STATE"});
 
@@ -1039,7 +1178,9 @@ static std::string HandleGetGuiAutomationState(
 static std::string HandleSetGuiAutomationConfig(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_GUI_AUTOMATION_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_GUI_AUTOMATION_CONFIG" << std::endl;
+	}
 	if (args.size() != 5) {
 		return make_response(false, {
 			"schema_version=1", "reason=malformed_request",
@@ -1094,7 +1235,9 @@ static std::string HandleSetGuiAutomationConfig(
 static std::string HandleSendMouseAbsGuarded(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SEND_MOUSE_ABS_GUARDED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SEND_MOUSE_ABS_GUARDED" << std::endl;
+	}
 	const int active_monitor = amiberry_get_active_input_monitor();
 	const auto geometry = amiberry_gui_geometry_snapshot();
 	const auto input = gui_input_config_snapshot();
@@ -1145,7 +1288,9 @@ static std::string HandleSendMouseAbsGuarded(
 static std::string HandleReleaseMouseButtons(
 	const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received RELEASE_MOUSE_BUTTONS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received RELEASE_MOUSE_BUTTONS" << std::endl;
+	}
 	if (!args.empty())
 		return make_response(false, {"Usage: RELEASE_MOUSE_BUTTONS"});
 	amiberry_gui_release_mouse_buttons(
@@ -1160,13 +1305,17 @@ static std::string HandleReleaseMouseButtons(
 
 static std::string HandlePing(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received PING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received PING" << std::endl;
+	}
 	return make_response(true, {"PONG"});
 }
 
 static std::string HandleQuickSave(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUICKSAVE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUICKSAVE" << std::endl;
+	}
 	int slot = 0;
 	if (!args.empty()) {
 		try {
@@ -1185,7 +1334,9 @@ static std::string HandleQuickSave(const std::vector<std::string>& args)
 
 static std::string HandleQuickLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received QUICKLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received QUICKLOAD" << std::endl;
+	}
 	int slot = 0;
 	if (!args.empty()) {
 		try {
@@ -1204,7 +1355,9 @@ static std::string HandleQuickLoad(const std::vector<std::string>& args)
 
 static std::string HandleGetJoyportMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_JOYPORT_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_JOYPORT_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_JOYPORT_MODE <port>"});
 	}
@@ -1234,7 +1387,9 @@ static std::string HandleGetJoyportMode(const std::vector<std::string>& args)
 
 static std::string HandleSetJoyportMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_JOYPORT_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_JOYPORT_MODE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_JOYPORT_MODE <port> <mode>"});
 	}
@@ -1263,7 +1418,9 @@ static std::string HandleSetJoyportMode(const std::vector<std::string>& args)
 
 static std::string HandleGetAutofire(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUTOFIRE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUTOFIRE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_AUTOFIRE <port>"});
 	}
@@ -1285,7 +1442,9 @@ static std::string HandleGetAutofire(const std::vector<std::string>& args)
 
 static std::string HandleSetAutofire(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_AUTOFIRE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_AUTOFIRE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_AUTOFIRE <port> <mode>"});
 	}
@@ -1314,7 +1473,9 @@ static std::string HandleSetAutofire(const std::vector<std::string>& args)
 
 static std::string HandleGetLEDStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_LED_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_LED_STATUS" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// Power LED
@@ -1342,7 +1503,9 @@ static std::string HandleGetLEDStatus(const std::vector<std::string>& args)
 
 static std::string HandleListHarddrives(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_HARDDRIVES" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_HARDDRIVES" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// List mounted hardfiles from prefs
@@ -1376,7 +1539,9 @@ static std::string HandleListHarddrives(const std::vector<std::string>& args)
 
 static std::string HandleSetDisplayMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_DISPLAY_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_DISPLAY_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_DISPLAY_MODE <mode> (0=window, 1=legacy fullscreen alias, 2=fullwindow)"});
 	}
@@ -1400,7 +1565,9 @@ static std::string HandleSetDisplayMode(const std::vector<std::string>& args)
 
 static std::string HandleGetDisplayMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DISPLAY_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DISPLAY_MODE" << std::endl;
+	}
 	const int mode = amiberry_normalize_gfx_fullscreen_mode(
 		currprefs.gfx_apmode[0].gfx_fullscreen);
 	const char* mode_names[] = {"window", "fullscreen", "fullwindow"};
@@ -1411,7 +1578,9 @@ static std::string HandleGetDisplayMode(const std::vector<std::string>& args)
 
 static std::string HandleSetNTSC(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_NTSC" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_NTSC" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_NTSC <0|1> (0=PAL, 1=NTSC)"});
 	}
@@ -1431,13 +1600,17 @@ static std::string HandleSetNTSC(const std::vector<std::string>& args)
 
 static std::string HandleGetNTSC(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_NTSC" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_NTSC" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.ntscmode ? 1 : 0), currprefs.ntscmode ? "NTSC" : "PAL"});
 }
 
 static std::string HandleSetSoundMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SOUND_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SOUND_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SOUND_MODE <mode> (0=off, 1=normal, 2=stereo, 3=best)"});
 	}
@@ -1461,7 +1634,9 @@ static std::string HandleSetSoundMode(const std::vector<std::string>& args)
 
 static std::string HandleGetSoundMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_SOUND_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_SOUND_MODE" << std::endl;
+	}
 	const int mode = currprefs.produce_sound;
 	const char* mode_names[] = {"off", "normal", "stereo", "best"};
 	std::string mode_name = (mode >= 0 && mode <= 3) ? mode_names[mode] : "unknown";
@@ -1471,20 +1646,26 @@ static std::string HandleGetSoundMode(const std::vector<std::string>& args)
 
 static std::string HandleToggleMouseGrab(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_MOUSE_GRAB" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_MOUSE_GRAB" << std::endl;
+	}
 	toggle_mousegrab();
 	return make_response(true);
 }
 
 static std::string HandleGetMouseSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_MOUSE_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_MOUSE_SPEED" << std::endl;
+	}
 	return make_response(true, {std::to_string(currprefs.input_mouse_speed)});
 }
 
 static std::string HandleSetCPUSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CPU_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CPU_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CPU_SPEED <speed> (-1=max, 0=cycle-exact, >0=percentage)"});
 	}
@@ -1504,7 +1685,9 @@ static std::string HandleSetCPUSpeed(const std::vector<std::string>& args)
 
 static std::string HandleGetCPUSpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_SPEED" << std::endl;
+	}
 	const int speed = currprefs.m68k_speed;
 	std::string desc;
 	if (speed == -1) {
@@ -1519,7 +1702,9 @@ static std::string HandleGetCPUSpeed(const std::vector<std::string>& args)
 
 static std::string HandleToggleRTG(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_RTG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_RTG" << std::endl;
+	}
 	int monid = 0;
 	if (!args.empty()) {
 		try {
@@ -1535,7 +1720,9 @@ static std::string HandleToggleRTG(const std::vector<std::string>& args)
 
 static std::string HandleSetFloppySpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_FLOPPY_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_FLOPPY_SPEED" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_FLOPPY_SPEED <speed> (0=turbo, 100=1x, 200=2x, 400=4x, 800=8x)"});
 	}
@@ -1560,7 +1747,9 @@ static std::string HandleSetFloppySpeed(const std::vector<std::string>& args)
 
 static std::string HandleGetFloppySpeed(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_FLOPPY_SPEED" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_FLOPPY_SPEED" << std::endl;
+	}
 	const int speed = currprefs.floppy_speed;
 	std::string desc;
 	switch (speed) {
@@ -1576,7 +1765,9 @@ static std::string HandleGetFloppySpeed(const std::vector<std::string>& args)
 
 static std::string HandleDiskWriteProtect(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISK_WRITE_PROTECT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISK_WRITE_PROTECT" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: DISK_WRITE_PROTECT <drive> <0|1>"});
 	}
@@ -1605,7 +1796,9 @@ static std::string HandleDiskWriteProtect(const std::vector<std::string>& args)
 
 static std::string HandleGetDiskWriteProtect(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DISK_WRITE_PROTECT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DISK_WRITE_PROTECT" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: GET_DISK_WRITE_PROTECT <drive>"});
 	}
@@ -1631,7 +1824,9 @@ static std::string HandleGetDiskWriteProtect(const std::vector<std::string>& arg
 
 static std::string HandleToggleStatusLine(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received TOGGLE_STATUS_LINE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received TOGGLE_STATUS_LINE" << std::endl;
+	}
 	// Cycle through: off -> chipset -> RTG -> both -> off
 	int current = changed_prefs.leds_on_screen;
 	int next;
@@ -1651,7 +1846,9 @@ static std::string HandleToggleStatusLine(const std::vector<std::string>& args)
 
 static std::string HandleSetChipset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CHIPSET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CHIPSET" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CHIPSET <chipset> (OCS, ECS_AGNUS, ECS_DENISE, ECS, AGA)"});
 	}
@@ -1683,7 +1880,9 @@ static std::string HandleSetChipset(const std::vector<std::string>& args)
 
 static std::string HandleGetChipset(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CHIPSET" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CHIPSET" << std::endl;
+	}
 	unsigned int mask = currprefs.chipset_mask;
 	std::string name;
 
@@ -1704,7 +1903,9 @@ static std::string HandleGetChipset(const std::vector<std::string>& args)
 
 static std::string HandleGetMemoryConfig(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_MEMORY_CONFIG" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_MEMORY_CONFIG" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// All memory sizes in KB
@@ -1719,7 +1920,9 @@ static std::string HandleGetMemoryConfig(const std::vector<std::string>& args)
 
 static std::string HandleGetFPS(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_FPS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_FPS" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	// FPS is stored in tenths (e.g., 500 = 50.0 fps)
@@ -1736,7 +1939,9 @@ static std::string HandleGetFPS(const std::vector<std::string>& args)
 
 static std::string HandleSetChipMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CHIP_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CHIP_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CHIP_MEM <size_kb> (0, 256, 512, 1024, 2048, 4096, 8192)"});
 	}
@@ -1782,7 +1987,9 @@ static std::string HandleSetChipMem(const std::vector<std::string>& args)
 
 static std::string HandleSetFastMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_FAST_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_FAST_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_FAST_MEM <size_kb> (0, 64, 128, 256, 512, 1024, 2048, 4096, 8192)"});
 	}
@@ -1823,7 +2030,9 @@ static std::string HandleSetFastMem(const std::vector<std::string>& args)
 
 static std::string HandleSetSlowMem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SLOW_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SLOW_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SLOW_MEM <size_kb> (0, 256, 512, 1024, 1536, 1792)"});
 	}
@@ -1858,7 +2067,9 @@ static std::string HandleSetSlowMem(const std::vector<std::string>& args)
 
 static std::string HandleSetZ3Mem(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_Z3_MEM" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_Z3_MEM" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_Z3_MEM <size_mb> (0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024)"});
 	}
@@ -1893,7 +2104,9 @@ static std::string HandleSetZ3Mem(const std::vector<std::string>& args)
 
 static std::string HandleGetCPUModel(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_MODEL" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_MODEL" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int model = currprefs.cpu_model;
@@ -1911,7 +2124,9 @@ static std::string HandleGetCPUModel(const std::vector<std::string>& args)
 
 static std::string HandleSetCPUModel(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_CPU_MODEL" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_CPU_MODEL" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_CPU_MODEL <model> (68000, 68010, 68020, 68030, 68040, 68060)"});
 	}
@@ -1959,7 +2174,9 @@ static std::string HandleSetCPUModel(const std::vector<std::string>& args)
 
 static std::string HandleSetWindowSize(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_WINDOW_SIZE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_WINDOW_SIZE" << std::endl;
+	}
 	if (args.size() < 2) {
 		return make_response(false, {"Usage: SET_WINDOW_SIZE <width> <height>"});
 	}
@@ -1985,7 +2202,9 @@ static std::string HandleSetWindowSize(const std::vector<std::string>& args)
 
 static std::string HandleGetWindowSize(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WINDOW_SIZE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WINDOW_SIZE" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int width = currprefs.gfx_monitor[0].gfx_size_win.width;
@@ -1999,7 +2218,9 @@ static std::string HandleGetWindowSize(const std::vector<std::string>& args)
 
 static std::string HandleSetScaling(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_SCALING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_SCALING" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_SCALING <method> (-1=auto, 0=nearest, 1=linear, 2=integer, 3=stretch)"});
 	}
@@ -2037,7 +2258,9 @@ static std::string HandleSetScaling(const std::vector<std::string>& args)
 
 static std::string HandleGetScaling(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_SCALING" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_SCALING" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int method = currprefs.scaling_method;
@@ -2053,7 +2276,9 @@ static std::string HandleGetScaling(const std::vector<std::string>& args)
 
 static std::string HandleSetLineMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_LINE_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_LINE_MODE" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_LINE_MODE <mode> (0=none, 1=double, 2=scanlines)"});
 	}
@@ -2099,7 +2324,9 @@ static std::string HandleSetLineMode(const std::vector<std::string>& args)
 
 static std::string HandleGetLineMode(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_LINE_MODE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_LINE_MODE" << std::endl;
+	}
 	std::vector<std::string> responses;
 
 	int vres = currprefs.gfx_vresolution;
@@ -2130,7 +2357,9 @@ static std::string HandleGetLineMode(const std::vector<std::string>& args)
 
 static std::string HandleSetResolution(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_RESOLUTION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_RESOLUTION" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_RESOLUTION <mode> (0=lores, 1=hires, 2=superhires)"});
 	}
@@ -2163,7 +2392,9 @@ static std::string HandleSetResolution(const std::vector<std::string>& args)
 
 static std::string HandleGetResolution(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_RESOLUTION" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_RESOLUTION" << std::endl;
+	}
 
 	int res = currprefs.gfx_resolution;
 	const char* res_names[] = {"lores", "hires", "superhires"};
@@ -2176,7 +2407,9 @@ static std::string HandleGetResolution(const std::vector<std::string>& args)
 
 static std::string HandleSetAutocrop(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_AUTOCROP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_AUTOCROP" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_AUTOCROP <0|1>"});
 	}
@@ -2203,7 +2436,9 @@ static std::string HandleSetAutocrop(const std::vector<std::string>& args)
 
 static std::string HandleGetAutocrop(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUTOCROP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUTOCROP" << std::endl;
+	}
 
 	bool enabled = currprefs.gfx_auto_crop;
 	return make_response(true, {std::to_string(enabled ? 1 : 0), enabled ? "enabled" : "disabled"});
@@ -2211,7 +2446,9 @@ static std::string HandleGetAutocrop(const std::vector<std::string>& args)
 
 static std::string HandleInsertWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received INSERT_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received INSERT_WHDLOAD" << std::endl;
+	}
 	if (args.empty()) {
 		return make_response(false, {"Usage: INSERT_WHDLOAD <path_to_lha_or_directory>"});
 	}
@@ -2250,7 +2487,9 @@ static std::string HandleInsertWHDLoad(const std::vector<std::string>& args)
 
 static std::string HandleEjectWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received EJECT_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received EJECT_WHDLOAD" << std::endl;
+	}
 
 	if (whdload_prefs.whdload_filename.empty()) {
 		return make_response(false, {"No WHDLoad game is currently loaded"});
@@ -2265,7 +2504,9 @@ static std::string HandleEjectWHDLoad(const std::vector<std::string>& args)
 
 static std::string HandleGetWHDLoad(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_WHDLOAD" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_WHDLOAD" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2294,7 +2535,9 @@ static std::string HandleGetWHDLoad(const std::vector<std::string>& args)
 #ifdef DEBUGGER
 static std::string HandleDebugActivate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_ACTIVATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_ACTIVATE" << std::endl;
+	}
 
 	if (debugger_active) {
 		return make_response(true, {"Debugger already active"});
@@ -2306,7 +2549,9 @@ static std::string HandleDebugActivate(const std::vector<std::string>& args)
 
 static std::string HandleDebugDeactivate(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_DEACTIVATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_DEACTIVATE" << std::endl;
+	}
 
 	if (!debugger_active) {
 		return make_response(true, {"Debugger not active"});
@@ -2318,7 +2563,9 @@ static std::string HandleDebugDeactivate(const std::vector<std::string>& args)
 
 static std::string HandleDebugStatus(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STATUS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STATUS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	responses.push_back("active=" + std::to_string(debugger_active ? 1 : 0));
@@ -2331,7 +2578,9 @@ static std::string HandleDebugStatus(const std::vector<std::string>& args)
 
 static std::string HandleDebugStep(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STEP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STEP" << std::endl;
+	}
 
 	int count = 1;
 	if (!args.empty()) {
@@ -2353,7 +2602,9 @@ static std::string HandleDebugStep(const std::vector<std::string>& args)
 
 static std::string HandleDebugStepOver(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_STEP_OVER" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_STEP_OVER" << std::endl;
+	}
 
 	if (!debugger_request_step_over()) {
 		return make_response(false, {"Debugger is not stopped"});
@@ -2364,7 +2615,9 @@ static std::string HandleDebugStepOver(const std::vector<std::string>& args)
 
 static std::string HandleDebugContinue(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DEBUG_CONTINUE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DEBUG_CONTINUE" << std::endl;
+	}
 
 	if (!debugger_request_continue()) {
 		return make_response(false, {"Debugger is not stopped"});
@@ -2376,7 +2629,9 @@ static std::string HandleDebugContinue(const std::vector<std::string>& args)
 
 static std::string HandleGetCPURegs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CPU_REGS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CPU_REGS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2423,7 +2678,9 @@ static std::string HandleGetCPURegs(const std::vector<std::string>& args)
 
 static std::string HandleGetCustomRegs(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_CUSTOM_REGS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_CUSTOM_REGS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2455,7 +2712,9 @@ static std::string HandleGetCustomRegs(const std::vector<std::string>& args)
 
 static std::string HandleDisassemble(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received DISASSEMBLE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received DISASSEMBLE" << std::endl;
+	}
 
 	uaecptr addr = M68K_GETPC;  // Default to current PC
 	int lines = 10;             // Default lines
@@ -2508,7 +2767,9 @@ static std::string HandleDisassemble(const std::vector<std::string>& args)
 #ifdef DEBUGGER
 static std::string HandleSetBreakpoint(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received SET_BREAKPOINT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received SET_BREAKPOINT" << std::endl;
+	}
 
 	if (args.empty()) {
 		return make_response(false, {"Usage: SET_BREAKPOINT <address> [slot]"});
@@ -2570,7 +2831,9 @@ static std::string HandleSetBreakpoint(const std::vector<std::string>& args)
 
 static std::string HandleClearBreakpoint(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received CLEAR_BREAKPOINT" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received CLEAR_BREAKPOINT" << std::endl;
+	}
 
 	std::string selector = args.empty() ? "ALL" : args[0];
 	std::transform(selector.begin(), selector.end(), selector.begin(), ::toupper);
@@ -2609,7 +2872,9 @@ static std::string HandleClearBreakpoint(const std::vector<std::string>& args)
 
 static std::string HandleListBreakpoints(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received LIST_BREAKPOINTS" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received LIST_BREAKPOINTS" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	int count = 0;
@@ -2636,7 +2901,9 @@ static std::string HandleListBreakpoints(const std::vector<std::string>& args)
 
 static std::string HandleGetCopperState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_COPPER_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_COPPER_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2654,7 +2921,9 @@ static std::string HandleGetCopperState(const std::vector<std::string>& args)
 
 static std::string HandleGetBlitterState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_BLITTER_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_BLITTER_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2690,7 +2959,9 @@ static std::string HandleGetBlitterState(const std::vector<std::string>& args)
 
 static std::string HandleGetDriveState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DRIVE_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DRIVE_STATE" << std::endl;
+	}
 
 	int drive = -1;  // All drives by default
 	if (!args.empty()) {
@@ -2738,7 +3009,9 @@ static std::string HandleGetDriveState(const std::vector<std::string>& args)
 
 static std::string HandleGetAudioState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_AUDIO_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_AUDIO_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 
@@ -2758,7 +3031,9 @@ static std::string HandleGetAudioState(const std::vector<std::string>& args)
 
 static std::string HandleGetDMAState(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received GET_DMA_STATE" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received GET_DMA_STATE" << std::endl;
+	}
 
 	std::vector<std::string> responses;
 	char buf[64];
@@ -2784,7 +3059,9 @@ static std::string HandleGetDMAState(const std::vector<std::string>& args)
 
 static std::string HandleHelp(const std::vector<std::string>& args)
 {
-	std::cout << "IPC: Received HELP" << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Received HELP" << std::endl;
+	}
 	std::vector<std::string> commands;
 	commands.emplace_back("Available commands:");
 	commands.emplace_back("QUIT, PAUSE, RESUME, RESET [HARD|SOFT]");
@@ -3163,7 +3440,9 @@ void Amiberry::IPC::IPCSetup()
 
 	// Check if existing socket is stale (from a crashed instance)
 	if (is_socket_stale(socket_path)) {
-		std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+		if (!currprefs.ipc_disable_logging) {
+			std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+		}
 		unlink(socket_path.c_str());
 	}
 
@@ -3189,7 +3468,9 @@ void Amiberry::IPC::IPCSetup()
 
 			// Check for stale socket at this path too
 			if (is_socket_stale(socket_path)) {
-				std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+				if (!currprefs.ipc_disable_logging) {
+					std::cout << "IPC: Removing stale socket at " << socket_path << std::endl;
+				}
 				unlink(socket_path.c_str());
 			}
 		}
@@ -3200,7 +3481,8 @@ void Amiberry::IPC::IPCSetup()
 
 		if (::bind(server_socket, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
 			bound = true;
-			if (instance > 0) {
+			socket_instance = instance;
+			if (instance > 0 && !currprefs.ipc_disable_logging) {
 				std::cout << "IPC: Default socket in use, using instance " << instance << std::endl;
 			}
 			break;
@@ -3235,7 +3517,9 @@ void Amiberry::IPC::IPCSetup()
 	InitHandlers();
 
 	ipc_active = true;
-	std::cout << "IPC: Listening on " << socket_path << std::endl;
+	if (!currprefs.ipc_disable_logging) {
+		std::cout << "IPC: Listening on " << socket_path << std::endl;
+	}
 
 	// Register cleanup
 	atexit(Amiberry::IPC::IPCCleanUp);
@@ -3278,6 +3562,11 @@ void Amiberry::IPC::IPCHandle()
 			HandleClient(client_socket);
 		}
 	}
+}
+
+int Amiberry::IPC::IPCInstance()
+{
+	return ipc_active ? socket_instance : 0;
 }
 
 bool Amiberry::IPC::IPCIsActive()

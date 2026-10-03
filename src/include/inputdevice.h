@@ -259,11 +259,17 @@ extern void inputdevice_read_msg(bool);
 extern void setmousebuttonstateall (int mouse, uae_u32 buttonbits, uae_u32 buttonmask);
 extern void setjoybuttonstateall (int joy, uae_u32 buttonbits, uae_u32 buttonmask);
 extern void setjoybuttonstate (int joy, int button, int state);
+extern void setjoybuttonstate_osk(int joy, int button, int state);
+extern void setjoystickstate_osk(int joy, int axis, int state, int max);
 extern void setmousebuttonstate (int mouse, int button, int state);
 extern uae_u32 getmousebuttonstate (int mouse);
 extern void setjoystickstate (int joy, int axle, int state, int max);
 // Whether an axis sample survives the enabled device's actual mapped consumers.
 extern bool inputdevice_is_joystick_axis_active(int joy, int axis, int state, int max);
+// Forget a host input edge that the OSK owned without dispatching its release
+// through gameplay mappings.
+extern void inputdevice_discard_osk_button_state(int joy, int button);
+extern void inputdevice_discard_osk_axis_state(int joy, int axis);
 extern int getjoystickstate (int mouse);
 void setmousestate (int mouse, int axis, int data, int isabs);
 extern int getmousestate (int mouse);
@@ -337,6 +343,7 @@ extern int inputdevice_getjoyportdevice (int port, int val);
 extern void inputdevice_validate_jports (struct uae_prefs *p, int changedport, bool *fixedports);
 extern void inputdevice_fix_prefs(struct uae_prefs *p, bool userconfig);
 extern void inputdevice_jportcustom_fixup(struct uae_prefs *p, TCHAR*, int);
+extern void inputdevice_joyport_keyboard_default(struct uae_prefs *p, const TCHAR *value, int portnum);
 
 extern void inputdevice_init (void);
 extern void inputdevice_close (void);

@@ -4663,7 +4663,8 @@ static void DISK_start(void)
 			if (drv->dskchange_time == -1) {
 				drv->dskchange_time = -2;
 				write_log(_T("Accessing state restored non-existing disk '%s'!\n"), drv->newname);
-				if (gui_ask_disk(dr, drv->newname)) {
+				if (gui_ask_disk(dr, drv->newname,
+					sizeof drv->newname / sizeof drv->newname[0])) {
 					if (drive_insert(drv, &currprefs, dr, drv->newname, false, false)) {
 						write_log(_T("Replacement disk '%s' inserted.\n"), drv->newname);
 						drv->dskready_up_time = 0;
@@ -5203,9 +5204,16 @@ uae_u16 disk_dmal(void)
 				dmal >>= 2;
 			}
 		} else {
-			dmal = 16 * (fifo_inuse[0] ? 1 : 0) + 4 * (fifo_inuse[1] ? 1 : 0) + 1 * (fifo_inuse[2] ? 1 : 0);
+			dmal = 32 * (fifo_inuse[0] ? 1 : 0) + 8 * (fifo_inuse[1] ? 1 : 0) + 2 * (fifo_inuse[2] ? 1 : 0);
 		}
 	}
+
+	// RW bits directly follow DSKLEN WRITE bit
+	bool write = (dsklen & 0x4000) != 0;
+	if (write) {
+		dmal |= 1 | 4 | 16;
+	}
+
 	disk_strobe = true;
 	return dmal;
 }

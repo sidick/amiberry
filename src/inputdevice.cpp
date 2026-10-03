@@ -218,6 +218,13 @@ static int draco_keybord_repeat_cnt, draco_keybord_repeat_code;
 static int osk_joystick_state = 0;
 static int osk_gamepad_state = 0;
 static thread_local bool osk_passthrough = false;
+static thread_local bool osk_capture_only = false;
+// OSK-owned directional events must not share the gameplay accumulators below:
+// a gameplay release can otherwise publish an OSK-held direction to joydir.
+static int osk_oleft[MAX_JPORTS], osk_oright[MAX_JPORTS];
+static int osk_otop[MAX_JPORTS], osk_obot[MAX_JPORTS];
+static int osk_horizclear[MAX_JPORTS], osk_vertclear[MAX_JPORTS];
+static int osk_relativecount[MAX_JPORTS][2];
 
 inputdevice_osk_passthrough::inputdevice_osk_passthrough(bool enabled)
 	: previous(osk_passthrough)
@@ -234,6 +241,12 @@ void osk_control(int x, int y, int button, int buttonstate, OskInputSource sourc
 {
 	if (!imgui_osk_is_active()) {
 		osk_joystick_state = osk_gamepad_state = 0;
+		for (int joy = 0; joy < MAX_JPORTS; ++joy) {
+			osk_oleft[joy] = osk_oright[joy] = 0;
+			osk_otop[joy] = osk_obot[joy] = 0;
+			osk_horizclear[joy] = osk_vertclear[joy] = 1;
+			osk_relativecount[joy][0] = osk_relativecount[joy][1] = 0;
+		}
 		return;
 	}
 	if (!vkbd_allowed(0))
@@ -578,6 +591,7 @@ static void copyjport (const struct uae_prefs *src, struct uae_prefs *dst, int n
 	dst->jports[num].submode = src->jports[num].submode;
 	dst->jports[num].autofire = src->jports[num].autofire;
 	dst->jports[num].nokeyboardoverride = src->jports[num].nokeyboardoverride;
+	dst->jports_default[num] = src->jports_default[num];
 #ifdef AMIBERRY
 	dst->jports[num].mousemap = src->jports[num].mousemap;
 #endif
@@ -2523,6 +2537,9 @@ static bool mousehack_last_abs_valid;
 static int mousehack_native_origin_x, mousehack_native_origin_y;
 static bool mousehack_native_source_origin_valid;
 static bool mousehack_position_is_native;
+#ifdef AMIBERRY
+static int mousehack_last_mouse;
+#endif
 static int tablet_maxx, tablet_maxy, tablet_maxz;
 static int tablet_resx, tablet_resy;
 static int tablet_maxax, tablet_maxay, tablet_maxaz;
@@ -2655,6 +2672,9 @@ static void mousehack_reset (void)
 	mousehack_native_origin_x = mousehack_native_origin_y = 0;
 	mousehack_native_source_origin_valid = false;
 	mousehack_position_is_native = false;
+#ifdef AMIBERRY
+	mousehack_last_mouse = 0;
+#endif
 	dimensioninfo_dbl = 0;
 	mousehack_alive_cnt = 0;
 	vp_xoffset = vp_yoffset = 0;
@@ -3136,6 +3156,37 @@ void inputdevice_tablet_info (int maxx, int maxy, int maxz, int maxax, int maxay
 	inputdevice_update_tablet_params();
 }
 
+#ifdef AMIBERRY
+// Native-screen magic mouse: the guest only services the absolute
+// IECLASS_POINTERPOS events from the virtual mouse driver at a low rate
+// (Intuition processes them behind its input handling), so the pointer
+// moves in visible steps (#2279). The hardware mouse counters, in contrast,
+// are serviced every vsync exactly like normal mouse input. Feed the delta
+// between two consecutively delivered absolute positions into the relative
+// mouse pipeline so the pointer tracks every counter update; the absolute
+// events still anchor the exact position, so there is no double movement.
+static void mousehack_send_native_relative_delta (int mouse, int dx, int dy)
+{
+	const int delta[2] = { dx, dy };
+	struct uae_input_device *id = &mice[mouse];
+
+	for (int axis = 0; axis < 2; axis++) {
+		const int v = delta[axis];
+		if (!v) {
+			continue;
+		}
+		// The delta is already exact in the absolute coordinate space that the
+		// guest's IECLASS_POINTERPOS events anchor to, so per-axis invert flags
+		// must not apply here; inverting only the delta would move the pointer
+		// opposite to the absolute position between guest driver updates.
+		for (int i = 0; i < MAX_INPUT_SUB_EVENT; i++) {
+			handle_input_event (id->eventid[ID_AXIS_OFFSET + axis][i], v, 0,
+				HANDLE_IE_FLAG_CANSTOPPLAYBACK);
+		}
+	}
+}
+#endif // AMIBERRY
+
 static void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits, bool position_valid)
 {
 #ifdef AMIBERRY
@@ -3174,12 +3225,25 @@ static void inputdevice_mh_abs (int x, int y, uae_u32 buttonbits, bool position_
 #endif
 
 	mousehack_enable ();
+#ifdef AMIBERRY
+	const int previous_abs_x = mousehack_last_abs_x;
+	const int previous_abs_y = mousehack_last_abs_y;
+	const bool previous_abs_valid = mousehack_last_abs_valid;
+#endif // AMIBERRY
 	// Keep the coordinate delivered after native screen-origin and host-hotspot
 	// compensation. The guest positions its native sprite from this coordinate,
 	// so their delta is the cursor hotspot.
 	mousehack_last_abs_x = x;
 	mousehack_last_abs_y = y;
 	mousehack_last_abs_valid = position_valid && mousehack_address;
+#ifdef AMIBERRY
+	if (position_valid && previous_abs_valid && currprefs.input_tablet == TABLET_MOUSEHACK
+		&& mousehack_alive () && mousehack_position_is_native
+		&& mousehack_last_mouse >= 0 && mousehack_last_mouse < MAX_INPUT_DEVICES
+		&& mice[mousehack_last_mouse].enabled) {
+		mousehack_send_native_relative_delta (mousehack_last_mouse, x - previous_abs_x, y - previous_abs_y);
+	}
+#endif // AMIBERRY
 	if (mousehack_address) {
 		uae_u8 tmp1[4], tmp2[4];
 		uae_u8 *p = mousehack_address;
@@ -5637,6 +5701,19 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 	if (ie->unit == 0 && ie->data >= AKS_FIRST) {
 		isaks = true;
 	}
+	const bool joystick_unit = ie->unit >= 1 && ie->unit <= 4;
+	const bool joystick_button = joystick_unit && (ie->type & 4);
+	const bool joystick_direction = joystick_unit
+		&& !(ie->type & (4 | 8 | 32 | 64 | 128));
+	const bool osk_joystick_input = joystick_button || joystick_direction;
+	const bool osk_capture_requested = osk_capture_only
+		&& vkbd_allowed(0) && imgui_osk_is_active();
+	const bool osk_action = isaks && ie->data == AKS_OSK;
+	if (osk_capture_requested && !osk_joystick_input && !osk_action)
+		return 1;
+	const bool osk_will_capture = !osk_passthrough
+		&& vkbd_allowed(0) && imgui_osk_is_active() && osk_joystick_input;
+
 
 #ifdef DEBUGGER
 	if (isaks) {
@@ -5673,7 +5750,7 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 
 	if ((inputdevice_logging & 1) || input_record || input_play)
 		write_log (_T("STATE=%05d MAX=%05d AF=%d QUAL=%06x '%s' \n"), state, max, autofire, (uae_u32)(qualifiers >> 32), ie->name);
-	if (autofire) {
+	if (autofire && !osk_will_capture && !osk_capture_requested) {
 		if (state)
 			queue_input_event (nr, NULL, state, max, currprefs.input_autofire_linecnt, 1);
 		else
@@ -5940,55 +6017,62 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 
 		} else {
 
-			int left = oleft[joy], right = oright[joy], top = otop[joy], bot = obot[joy];
+			const bool capture_osk = !osk_passthrough
+				&& vkbd_allowed(0) && imgui_osk_is_active();
+			int& stored_left = capture_osk ? osk_oleft[joy] : oleft[joy];
+			int& stored_right = capture_osk ? osk_oright[joy] : oright[joy];
+			int& stored_top = capture_osk ? osk_otop[joy] : otop[joy];
+			int& stored_bot = capture_osk ? osk_obot[joy] : obot[joy];
+			int& clear_horizontal = capture_osk ? osk_horizclear[joy] : horizclear[joy];
+			int& clear_vertical = capture_osk ? osk_vertclear[joy] : vertclear[joy];
+			int left = stored_left, right = stored_right;
+			int top = stored_top, bot = stored_bot;
 			if (ie->type & 16) {
 				/* button to axis mapping */
 				if (ie->data & DIR_LEFT) {
-					left = oleft[joy] = state ? 1 : 0;
-					if (horizclear[joy] && left) {
-						horizclear[joy] = 0;
-						right = oright[joy] = 0;
+					left = stored_left = state ? 1 : 0;
+					if (clear_horizontal && left) {
+						clear_horizontal = 0;
+						right = stored_right = 0;
 					}
 				}
 				if (ie->data & DIR_RIGHT) {
-					right = oright[joy] = state ? 1 : 0;
-					if (horizclear[joy] && right) {
-						horizclear[joy] = 0;
-						left = oleft[joy] = 0;
+					right = stored_right = state ? 1 : 0;
+					if (clear_horizontal && right) {
+						clear_horizontal = 0;
+						left = stored_left = 0;
 					}
 				}
 				if (ie->data & DIR_UP) {
-					top = otop[joy] = state ? 1 : 0;
-					if (vertclear[joy] && top) {
-						vertclear[joy] = 0;
-						bot = obot[joy] = 0;
+					top = stored_top = state ? 1 : 0;
+					if (clear_vertical && top) {
+						clear_vertical = 0;
+						bot = stored_bot = 0;
 					}
 				}
 				if (ie->data & DIR_DOWN) {
-					bot = obot[joy] = state ? 1 : 0;
-					if (vertclear[joy] && bot) {
-						vertclear[joy] = 0;
-						top = otop[joy] = 0;
+					bot = stored_bot = state ? 1 : 0;
+					if (clear_vertical && bot) {
+						clear_vertical = 0;
+						top = stored_top = 0;
 					}
 				}
 			} else {
 				/* "normal" joystick axis */
-				int deadzone = currprefs.input_joystick_deadzone * max / 100;
+				const int deadzone = currprefs.input_joystick_deadzone * max / 100;
 				int neg, pos;
 				if (max == 0) {
-					int cnt;
-					int mmax = 50, mextra = 10;
-					int unit = (ie->data & (4 | 8)) ? 1 : 0;
-					// relative events
-					relativecount[joy][unit] += state;
-					cnt = relativecount[joy][unit];
-					neg = cnt < -mmax;	
-					pos = cnt > mmax;
-					if (cnt < -(mmax + mextra))
-						cnt = -(mmax + mextra);
-					if (cnt > (mmax + mextra))
-						cnt = (mmax + mextra);
-					relativecount[joy][unit] = cnt;
+					const int mmax = 50, mextra = 10;
+					const int unit = (ie->data & (4 | 8)) ? 1 : 0;
+					int& count = capture_osk
+						? osk_relativecount[joy][unit] : relativecount[joy][unit];
+					count += state;
+					neg = count < -mmax;
+					pos = count > mmax;
+					if (count < -(mmax + mextra))
+						count = -(mmax + mextra);
+					if (count > (mmax + mextra))
+						count = mmax + mextra;
 				} else {
 					if (state < deadzone && state > -deadzone)
 						state = 0;
@@ -5996,42 +6080,39 @@ static int handle_input_event2(int nr, int state, int max, int flags, int extra)
 					pos = state > 0 ? 1 : 0;
 				}
 				if (ie->data & DIR_LEFT) {
-					left = oleft[joy] = neg;
-					if (horizclear[joy] && left) {
-						horizclear[joy] = 0;
-						right = oright[joy] = 0;
+					left = stored_left = neg;
+					if (clear_horizontal && left) {
+						clear_horizontal = 0;
+						right = stored_right = 0;
 					}
 				}
 				if (ie->data & DIR_RIGHT) {
-					right = oright[joy] = pos;
-					if (horizclear[joy] && right) {
-						horizclear[joy] = 0;
-						left = oleft[joy] = 0;
+					right = stored_right = pos;
+					if (clear_horizontal && right) {
+						clear_horizontal = 0;
+						left = stored_left = 0;
 					}
 				}
 				if (ie->data & DIR_UP) {
-					top = otop[joy] = neg;
-					if (vertclear[joy] && top) {
-						vertclear[joy] = 0;
-						bot = obot[joy] = 0;
+					top = stored_top = neg;
+					if (clear_vertical && top) {
+						clear_vertical = 0;
+						bot = stored_bot = 0;
 					}
 				}
 				if (ie->data & DIR_DOWN) {
-					bot = obot[joy] = pos;
-					if (vertclear[joy] && bot) {
-						vertclear[joy] = 0;
-						top = otop[joy] = 0;
+					bot = stored_bot = pos;
+					if (clear_vertical && bot) {
+						clear_vertical = 0;
+						top = stored_top = 0;
 					}
 				}
 			}
 			mouse_deltanoreset[joy][0] = 1;
 			mouse_deltanoreset[joy][1] = 1;
-			if (!osk_passthrough && vkbd_allowed(0) && imgui_osk_is_active()) {
-				int dx = 0, dy = 0;
-				if (left) dx = -1;
-				else if (right) dx = 1;
-				if (top) dy = -1;
-				else if (bot) dy = 1;
+			if (capture_osk) {
+				const int dx = left ? -1 : right ? 1 : 0;
+				const int dy = top ? -1 : bot ? 1 : 0;
 				osk_control(dx, dy, 0, 0, OskInputSource::EmulatedJoystick);
 			}
 			else {
@@ -8467,6 +8548,9 @@ void inputdevice_updateconfig_internal (struct uae_prefs *srcprefs, struct uae_p
 	keyboard_default = keyboard_default_table[currprefs.input_keyboard_type];
 
 	inputdevice_copyjports(srcprefs, dstprefs);
+	for (int i = 0; i < MAX_JPORTS; i++) {
+		default_keyboard_layout[i] = dstprefs->jports_default[i];
+	}
 	resetinput ();
 
 	joysticks = dstprefs->joystick_settings[dstprefs->input_selected_setting];
@@ -10197,6 +10281,14 @@ void setjoybuttonstate (int joy, int button, int state)
 	setbuttonstateall (&joysticks[joy], &joysticks2[joy], button, state ? 1 : 0);
 }
 
+void setjoybuttonstate_osk(const int joy, const int button, const int state)
+{
+	const bool previous = osk_capture_only;
+	osk_capture_only = true;
+	setjoybuttonstate(joy, button, state);
+	osk_capture_only = previous;
+}
+
 /* buttonmask = 1 = normal toggle button, 0 = mouse wheel turn or similar
 */
 void setjoybuttonstateall (int joy, uae_u32 buttonbits, uae_u32 buttonmask)
@@ -10242,6 +10334,21 @@ void setmousebuttonstate (int mouse, int button, int state)
 	if (obuttonmask != mice2[mouse].buttonmask)
 		mousehack_helper (mice2[mouse].buttonmask);
 }
+
+void inputdevice_discard_osk_button_state(const int joy, const int button)
+{
+	if (joy < 0 || joy >= MAX_INPUT_DEVICES || button < 0 || button >= ID_BUTTON_TOTAL)
+		return;
+	joysticks2[joy].buttonmask &= ~(1u << button);
+}
+
+void inputdevice_discard_osk_axis_state(const int joy, const int axis)
+{
+	if (joy < 0 || joy >= MAX_INPUT_DEVICES || axis < 0 || axis >= ID_AXIS_TOTAL)
+		return;
+	memset(joysticks2[joy].states[axis], 0, sizeof joysticks2[joy].states[axis]);
+}
+
 
 uae_u32 getmousebuttonstate (int mouse)
 {
@@ -10358,6 +10465,15 @@ void setjoystickstate (int joy, int axis, int state, int max)
 	}
 	id2->states[axis][MAX_INPUT_SUB_EVENT] = v1;
 }
+
+void setjoystickstate_osk(const int joy, const int axis, const int state, const int max)
+{
+	const bool previous = osk_capture_only;
+	osk_capture_only = true;
+	setjoystickstate(joy, axis, state, max);
+	osk_capture_only = previous;
+}
+
 int getjoystickstate (int joy)
 {
 	if (testmode)
@@ -10401,8 +10517,12 @@ void setmousestate (int mouse, int axis, int data, int isabs)
 				lastmx = data;
 			else
 				lastmy = data;
-			if (axis)
+			if (axis) {
+#ifdef AMIBERRY
+				mousehack_last_mouse = mouse;
+#endif
 				mousehack_helper (mice2[mouse].buttonmask);
+			}
 		}
 #if OUTPUTDEBUG
 		OutputDebugString(_T("-> exit2\n"));
@@ -10434,8 +10554,12 @@ void setmousestate (int mouse, int axis, int data, int isabs)
 		} else {
 			lastmy = data;
 		}
-		if (axis)
+		if (axis) {
+#ifdef AMIBERRY
+			mousehack_last_mouse = mouse;
+#endif
 			mousehack_helper (mice2[mouse].buttonmask);
+		}
 		if (currprefs.input_tablet == TABLET_MOUSEHACK && mousehack_alive() && axis < 2) {
 #if OUTPUTDEBUG
 			OutputDebugString(_T("-> exit4\n"));
@@ -10635,7 +10759,7 @@ static void inputdevice_get_previous_joy(struct uae_prefs *p, int portnum, bool 
 			found = inputdevice_joyport_config(p, jp->idc.name, jp->idc.configname, portnum, jp->mode, jp->submode, 1, true) != 0;
 			if (!found && jp->id == JPORT_UNPLUGGED)
 				found = inputdevice_joyport_config(p, jp->idc.name, NULL, portnum, jp->mode, jp->submode, 1, true) != 0;
-		} else if (jp->id < JSEM_JOYS && jp->id >= 0) {
+		} else if (jp->id < JSEM_JOYS && jp->id >= 0 && p->jports_default[portnum] == 0) {
 			jpx->id = jp->id;
 			found = true;
 		}
@@ -10719,9 +10843,30 @@ void inputdevice_validate_jports (struct uae_prefs *p, int changedport, bool *fi
 	}
 }
 
+void inputdevice_joyport_keyboard_default(struct uae_prefs *p, const TCHAR *value, int portnum)
+{
+	if (_tcsncmp(value, _T("kbd"), 3) == 0) {
+		TCHAR *endptr;
+		const long layout = _tcstol(value + 3, &endptr, 10);
+		if (layout > 0 && layout <= JSEM_LASTKBD && *endptr == 0) {
+			p->jports_default[portnum] = JSEM_KBDLAYOUT + (int)layout;
+		} else {
+			p->jports_default[portnum] = 0;
+		}
+	} else if (_tcscmp(value, _T("none")) == 0) {
+		p->jports_default[portnum] = -1;
+	} else {
+		p->jports_default[portnum] = 0;
+	}
+	default_keyboard_layout[portnum] = p->jports_default[portnum];
+}
+
 void inputdevice_joyport_config_store(struct uae_prefs *p, const TCHAR *value, int portnum, int mode, int submode, int type)
 {
 	struct jport *jp = &p->jports[portnum];
+	if (value == NULL) {
+		return;
+	}
 	if (type == 2) {
 		_tcscpy(jp->idc.name, value);
 	} else if (type == 1) {
@@ -10875,7 +11020,10 @@ int inputdevice_joyport_config(struct uae_prefs *p, const TCHAR *value1, const T
 						p->jports[portnum].submode = submode;
 					}
 					if (start < JSEM_JOYS) {
-						default_keyboard_layout[portnum] = start + 1;
+						// only mark as default if not configured
+						if (p->jports_default[portnum] == 0) {
+							default_keyboard_layout[portnum] = start + 1;
+						}
 					}
 					if (got == 2 && candefault) {
 						inputdevice_store_used_device(&p->jports[portnum], portnum, false);

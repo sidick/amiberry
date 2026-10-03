@@ -12,6 +12,10 @@
 
 #if defined(WITH_UAENET_PCAP) || defined(WITH_UAENET_TAP)
 #ifdef WITH_UAENET_PCAP
+#ifdef __APPLE__
+#include <sys/ioctl.h>
+#include <net/bpf.h>
+#endif
 #include <pcap.h>
 #endif
 #ifdef WITH_UAENET_TAP
@@ -28,6 +32,10 @@
 #include "options.h"
 #include "sana2.h"
 #include "threaddep/thread.h"
+#include "uaenet_host.h"
+#ifdef USE_IPC_SOCKET
+#include "amiberry_ipc.h"
+#endif
 
 #define MAX_MTU 1500
 #ifndef ETH_HLEN
@@ -390,13 +398,63 @@ static void uaenet_close_driver_internal(struct uaenet_data *ud)
 }
 
 static struct netdriverdata nd[MAX_TOTAL_NET_DEVICES + 1];
+#ifdef WITH_UAENET_PCAP
+static bool pcap_enumerated;
+#endif
+
+// Number of this emulator instance among those running on the host.
+static int uaenet_instance()
+{
+#ifdef USE_IPC_SOCKET
+    return Amiberry::IPC::IPCInstance();
+#else
+    return 0;
+#endif
+}
+
+// Sets a device's guest address from its host interface address (originalmac,
+// all zero if unknown), offset by the instance number so that instances
+// sharing the interface differ. uaenet.device passes no MAC to uaenet_open()
+// and uses this one.
+static void uaenet_set_guest_mac(struct netdriverdata *ndd)
+{
+    static const uae_u8 unknown[6] = {};
+    bool known = memcmp(ndd->originalmac, unknown, 6) != 0;
+    uaenet_guest_mac(known ? ndd->originalmac : nullptr, uaenet_instance(), ndd->mac);
+}
 
 #ifdef WITH_UAENET_PCAP
 // Enumerate network devices
 struct netdriverdata *uaenet_enumerate(const TCHAR *name)
 {
+#ifdef AMIBERRY
+    const TCHAR *requested_name = name;
+#endif
+    // A single-device lookup must not re-enumerate if the device is already known:
+    // clearing nd[] would invalidate the pointers cached in the global ndd[] array
+    // from target_ethernet_enumerate() (same as uaenet_tap_enumerate()).
+    if (name != NULL && name[0] != '\0') {
+        for (int i = 0; i < MAX_TOTAL_NET_DEVICES; i++) {
+            if (nd[i].active && nd[i].name && !_tcsicmp(name, nd[i].name))
+                return &nd[i];
+        }
+#ifdef AMIBERRY
+        if (pcap_enumerated)
+            return NULL;
+#endif
+    }
+
     pcap_if_t *alldevs;
     char errbuf[PCAP_ERRBUF_SIZE];
+#ifdef AMIBERRY
+    // A named lookup builds the full cache once, so subsequent NIC opens do
+    // not clear descriptors that are already in use by another card.
+    if (name != NULL && name[0] != '\0') {
+        name = NULL;
+    } else {
+        uaenet_enumerate_free();
+    }
+#endif
     memset(nd, 0, sizeof(nd));
 
     if (pcap_findalldevs(&alldevs, errbuf) == -1) {
@@ -419,6 +477,10 @@ struct netdriverdata *uaenet_enumerate(const TCHAR *name)
 
         nd[j].name = n2;
         nd[j].type = UAENET_PCAP;
+        int mtu = uaenet_host_mtu(d->name);
+        nd[j].mtu = (mtu > 0 && mtu < MAX_MTU) ? mtu : MAX_MTU;
+        uaenet_host_mac(d->name, nd[j].originalmac);
+        uaenet_set_guest_mac(&nd[j]);
         nd[j].active = 1;
         nd[j].driverdata = nullptr; // Initialize driverdata to nullptr
         j++;
@@ -429,6 +491,16 @@ struct netdriverdata *uaenet_enumerate(const TCHAR *name)
 
     pcap_freealldevs(alldevs);
     enumerated = 1;
+#ifdef AMIBERRY
+    pcap_enumerated = true;
+    if (requested_name && requested_name[0] != '\0') {
+        for (int i = 0; i < MAX_TOTAL_NET_DEVICES; i++) {
+            if (nd[i].active && nd[i].name && !_tcsicmp(requested_name, nd[i].name))
+                return &nd[i];
+        }
+        return NULL;
+    }
+#endif
     return nd;
 }
 #endif
@@ -505,8 +577,15 @@ int uaenet_open(void *vsd, struct netdriverdata *ndd, void *userdata, ethernet_g
     strncpy(ud->name, ndd->name, MAX_DPATH - 1);
     ud->name[MAX_DPATH - 1] = '\0';
 
-    if (mac)
-        memcpy(ud->mac_addr, mac, 6);
+    // uaenet.device passes no MAC; use the enumerated address, set again in
+    // case the device was enumerated before the instance number was known.
+    if (!mac) {
+        uaenet_set_guest_mac(ndd);
+        mac = ndd->mac;
+        write_log(_T("UAENET: '%s' guest MAC %02X:%02X:%02X:%02X:%02X:%02X\n"), ndd->name,
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+    memcpy(ud->mac_addr, mac, 6);
 
     // Destroy existing semaphores before reinitializing to prevent value
     // inflation — uae_sem_init() on an existing semaphore calls SDL_SignalSemaphore()
@@ -555,6 +634,21 @@ int uaenet_open(void *vsd, struct netdriverdata *ndd, void *userdata, ethernet_g
             uaenet_close_driver_internal(ud);
             return 0;
         }
+
+#ifdef __APPLE__
+        // On macOS, every BPF write wakes readers sleeping on the same
+        // descriptor, and a woken read that has not timed out goes back to
+        // sleep for a full new read timeout. While the guest transmits more
+        // often than the 10 ms timeout, received packets stay buffered until
+        // transmission pauses or the buffer fills. Immediate mode returns
+        // each packet as soon as it arrives.
+        u_int immediate = 1;
+        if (ioctl(pcap_fileno(ud->handle), BIOCIMMEDIATE, &immediate) < 0) {
+            write_log(_T("UAENET: Failed to enable immediate mode: %s\n"), strerror(errno));
+            uaenet_close_driver_internal(ud);
+            return 0;
+        }
+#endif
 
         // BPF filter: accept packets destined to the Amiga's MAC, broadcast, or
         // multicast — but reject packets sourced from the Amiga's own MAC.
@@ -751,6 +845,9 @@ void uaenet_enumerate_free()
         }
     }
     enumerated = 0;
+#ifdef AMIBERRY
+    pcap_enumerated = false;
+#endif
 #endif
 }
 
@@ -813,6 +910,7 @@ void uaenet_tap_enumerate_free(void)
 
 struct netdriverdata *uaenet_tap_enumerate(const TCHAR *name)
 {
+    const TCHAR *requested_name = name;
     // If already enumerated and doing a single-device lookup, search the existing
     // array. Re-enumerating would free the tap_nd[] name/desc strings, invalidating
     // pointers cached in the global ndd[] array from target_ethernet_enumerate().
@@ -823,6 +921,11 @@ struct netdriverdata *uaenet_tap_enumerate(const TCHAR *name)
         }
         return NULL;  // not found — don't return a wrong device
     }
+
+    // Populate all TAP descriptors on the first named lookup, so another
+    // card can select a different adapter without rebuilding this cache.
+    if (name != NULL && name[0] != '\0')
+        name = NULL;
 
     uaenet_tap_enumerate_free();
 
@@ -870,6 +973,8 @@ struct netdriverdata *uaenet_tap_enumerate(const TCHAR *name)
         snprintf(mtu_path, sizeof(mtu_path), "/sys/class/net/%s/mtu", ent->d_name);
         long mtu = read_sysfs_long(mtu_path);
         tap_nd[j].mtu = (mtu > 0) ? (int)mtu : 1500;
+        uaenet_host_mac(ent->d_name, tap_nd[j].originalmac);
+        uaenet_set_guest_mac(&tap_nd[j]);
 
         tap_nd_count++;
         if (name != NULL)
@@ -878,6 +983,13 @@ struct netdriverdata *uaenet_tap_enumerate(const TCHAR *name)
 
     closedir(dir);
     enumerated = 1;
+    if (requested_name && requested_name[0] != '\0') {
+        for (int i = 0; i < tap_nd_count; i++) {
+            if (tap_nd[i].active && tap_nd[i].name && !_tcsicmp(requested_name, tap_nd[i].name))
+                return &tap_nd[i];
+        }
+        return NULL;
+    }
     return tap_nd;
 }
 

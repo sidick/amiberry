@@ -34,6 +34,7 @@
 #include "target.h"
 #include "gfx_colors.h"
 #include "gfx_prefs_check.h"
+#include "service_transport.h"
 
 static int display_change_requested;
 
@@ -64,9 +65,14 @@ int check_prefs_changed_gfx()
 
 	const bool native_code_changed = currprefs.native_code != changed_prefs.native_code;
 	if (native_code_changed) {
-		if (currprefs.native_code && !changed_prefs.native_code)
+		const bool disabled = currprefs.native_code && !changed_prefs.native_code;
+		if (disabled)
 			uaelib_host_cleanup();
 		currprefs.native_code = changed_prefs.native_code;
+		// After the flag flips no new plugin dispatch can start; one already in
+		// flight is dropped by the transport's reset generation.
+		if (disabled)
+			service_transport_reset();
 	}
 
 	if (!config_changed && !display_change_requested)
@@ -426,12 +432,15 @@ int check_prefs_changed_gfx()
 				}
 			}
 			if (c & 1024) {
+				reset_drawing();
 				target_graphics_buffer_update(mon->monitor_id, true);
 			}
 			if (c & 512) {
+				reset_drawing();
 				reopen_gfx(mon);
 			}
 			if ((c & 16) || ((c & 8) && keepfsmode)) {
+				reset_drawing();
 				if (reopen(mon, c & 2, unacquired == false)) {
 					c |= 2;
 				} else {
@@ -443,6 +452,7 @@ int check_prefs_changed_gfx()
 					inputdevice_unacquire();
 					unacquired = true;
 				}
+				reset_drawing();
 				close_windows(mon, false);
 				if (currprefs.gfx_api != changed_prefs.gfx_api || currprefs.gfx_api_options != changed_prefs.gfx_api_options) {
 					currprefs.gfx_api = changed_prefs.gfx_api;

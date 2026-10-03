@@ -68,7 +68,7 @@
 #endif
 #include "ethernet.h"
 #include "drawing.h"
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 #include "videograb.h"
 #endif
 #ifdef AHI
@@ -87,6 +87,9 @@
 #include "dsp3210/dsp_glue.h"
 #endif
 #include "keyboard_mcu.h"
+#ifdef AMIBERRY
+#include "service_transport.h"
+#endif
 
 #define MAX_DEVICE_ITEMS 64
 
@@ -273,6 +276,11 @@ void devices_reset(int hardreset)
 #endif
 	ethernet_reset();
 	reset_traps();
+#ifdef AMIBERRY
+	// Only now: reset_traps() has drained the trap workers and their queues,
+	// so no plugin dispatch from before the reset can still run.
+	service_transport_reset();
+#endif
 #ifdef FILESYS
 	filesys_prepare_reset();
 	filesys_reset();
@@ -400,6 +408,9 @@ void virtualdevice_free(void)
 	execute_device_items(device_leaves_early, device_leave_early_cnt);
 
 	reset_traps();
+#ifdef AMIBERRY
+	service_transport_reset();
+#endif
 	free_traps();
 #ifdef FILESYS
 	filesys_cleanup();
@@ -426,13 +437,13 @@ void virtualdevice_free(void)
 #endif
 	savestate_free();
 	memory_cleanup();
+	rtarea_free();
 	free_shm();
 	cfgfile_addcfgparam(0);
 #ifdef DRIVESOUND
 	driveclick_free();
 #endif
 	ethernet_enumerate_free();
-	rtarea_free();
 	drawing_free();
 #ifdef WITH_DRACO
 	draco_free();
@@ -559,7 +570,7 @@ void devices_pause(void)
 #ifdef RETROPLATFORM
 	rp_pause(1);
 #endif
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 	pausevideograb(1);
 #endif
 	ethernet_pause(1);
@@ -577,7 +588,7 @@ void devices_unpause(void)
 #ifdef WITH_DSP
 	dsp_pause(0);
 #endif
-#ifdef AVIOUTPUT
+#ifdef VIDEOGRAB
 	pausevideograb(0);
 #endif
 	ethernet_pause(0);

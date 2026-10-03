@@ -886,6 +886,10 @@ struct uae_prefs {
 	TCHAR prtname[MAX_DPATH];
 	TCHAR sername[MAX_DPATH];
 	TCHAR a2065name[MAX_DPATH];
+#ifdef AMIBERRY
+	TCHAR zz9000net_name[MAX_DPATH];
+	bool zz9000_int2;
+#endif
 	TCHAR ne2000pciname[MAX_DPATH];
 	TCHAR ne2000pcmcianame[MAX_DPATH];
 	TCHAR picassoivromfile[MAX_DPATH];
@@ -1073,6 +1077,7 @@ struct uae_prefs {
 
 	struct jport jports[MAX_JPORTS];
 	struct jport_custom jports_custom[MAX_JPORTS_CUSTOM];
+	int jports_default[MAX_JPORTS];
 	int input_selected_setting;
 	int input_joymouse_multiplier;
 	int input_joymouse_deadzone;
@@ -1129,6 +1134,7 @@ struct uae_prefs {
 	bool use_retroarch_statebuttons;
 	bool use_retroarch_vkbd;
 
+	bool ipc_disable_logging;
 #endif
 };
 
@@ -1457,10 +1463,10 @@ struct amiberry_options
 #endif
 char default_vkbd_language[128] = "US";
 int default_vkbd_transparency;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(LIBRETRO)
 // Guide is intercepted as the menu trigger on Android (see
-// handle_controller_button_event), so the on-screen keyboard toggle
-// needs a different default button there.
+// handle_controller_button_event), and the libretro joypad action space
+// has no guide button at all, so both frontends need a different default.
 char default_vkbd_toggle[128] = "leftstick";
 #else
 char default_vkbd_toggle[128] = "guide";
